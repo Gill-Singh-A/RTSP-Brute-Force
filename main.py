@@ -1,7 +1,9 @@
 #! /usr/bin/env python3
 
-import cv2, pickle, json
+import cv2
 from datetime import date
+from urllib.parse import quote
+from threading import Thread, Lock
 from optparse import OptionParser
 from colorama import Fore, Back, Style
 from time import strftime, localtime, sleep, time
@@ -23,8 +25,21 @@ def get_arguments(*args):
         parser.add_option(arg[0], arg[1], dest=arg[2], help=arg[3])
     return parser.parse_args()[0]
 
+lock = Lock()
+
 threads = 100
 verbose = False
+
+def loginRTSP(ip, user, password):
+    try:
+        video_capture = cv2.VideoCapture(f"rtsp://{user}:{password}@{ip}")
+        ret, frame = video_capture.read()
+        if ret:
+            return True
+        else:
+            return False
+    except:
+        return False
 
 if __name__ == "__main__":
     arguments = get_arguments(('-i', "--ip", "ip", "File Name of List of IP Addresses (Seperated by ',')"),
@@ -39,6 +54,14 @@ if __name__ == "__main__":
     if not arguments.user:
         display('*', f"No {Back.MAGENTA}USER{Back.RESET} Specified")
         display(':', f"Trying to Find {Back.MAGENTA}Unauthorized Access{Back.RESET}")
+    else:
+        arguments.user = quote(arguments.user)
+    if not arguments.password:
+        display('*', f"No {Back.MAGENTA}PASSWORD{Back.RESET} Specified")
+        display(':', f"Setting Password to {Back.MAGENTA}Blank{Back.RESET}")
+        arguments.password = ''
+    else:
+        arguments.password = quote(arguments.password)
     if not arguments.threads:
         arguments.threads = threads
     else:
