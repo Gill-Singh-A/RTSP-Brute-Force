@@ -49,3 +49,16 @@ if __name__ == "__main__":
         arguments.verbose = False
     if not arguments.write:
         arguments.write = f"{date.today()} {strftime('%H_%M_%S', localtime())}"
+    ips = []
+    arguments.ip = arguments.ip.split(',')
+    display(':', "Loading IP Addresses from Files")
+    for ip_file in arguments.ip:
+        try:
+            with open(ip_file, 'r') as file:
+                ips.extend([ip for ip in file.read().split('\n') if ip != ''])
+        except FileNotFoundError:
+            display('-', f"File {Back.YELLOW}{ip_file}{Back.RESET} not Found!")
+        except:
+            display('-', f"Error while reading File {Back.YELLOW}{ip_file}{Back.RESET}")
+    display('+', "Loaded IP Addresses from Files")
+    display(':', f"Total Number of IP Addresses = {Back.MAGENTA}{len(ips)}{Back.RESET}")
