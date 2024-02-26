@@ -129,3 +129,7 @@ if __name__ == "__main__":
     display(':', f"\tSuccessful Authorization = {Back.MAGENTA}{len(successful_logins)}{Back.RESET}")
     display(':', f"\tTime Taken               = {Back.MAGENTA}{t2-t1:.2f} seconds{Back.RESET}")
     display(':', f"\tRate                     = {Back.MAGENTA}{len(total_ips)/(t2-t1):.2f} IPs/second{Back.RESET}")
+    display(':', f"Dumping Successfully Authorized IP Addresses in file {Back.MAGENTA}{arguments.write}{Back.RESET}", start='\n')
+    with open(arguments.write, 'w') as file:
+        file.write('\n'.join(successful_logins))
+    display('+', f"Dumped Successfully Authorized IP Addresses in file {Back.MAGENTA}{arguments.write}{Back.RESET}")
