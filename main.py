@@ -32,6 +32,7 @@ verbose = False
 
 successful_logins = []
 
+@contextlib.contextmanager
 def stdout_nil():
     original_stdout = sys.stdout
     sys.stdout = io.StringIO()
