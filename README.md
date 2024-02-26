@@ -11,7 +11,7 @@ Modules/Packages used:
 * sys
 * datetime
 * urllib
-* threading
+* multiprocessing
 * optparse
 * colorama
 * time
