@@ -62,6 +62,8 @@ def loginHandler(ips, user, password, verbose=False):
                 successful_logins.append(ip)
                 if verbose:
                     display('+', f"{Back.MAGENTA}{ip}{Back.RESET} => Access Granted\tAccess Gained = {Back.MAGENTA}{len(successful_logins)}{Back.RESET}")
+                else:
+                    display('-', f"{Back.MAGENTA}{ip}{Back.RESET} => Access Denied")
 
 if __name__ == "__main__":
     arguments = get_arguments(('-i', "--ip", "ip", "File Name of List of IP Addresses (Seperated by ',')"),
@@ -113,8 +115,17 @@ if __name__ == "__main__":
     ip_division = [ips[group*total_ips//arguments.threads:(group+1)*total_ips//arguments.threads] for group in range(arguments.threads)]
     display('+', f"Created {Back.MAGENTA}{arguments.threads}{Back.RESET}")
     display(':', f"Starting {Back.MAGENTA}{arguments.threads}{Back.RESET}", start='\n')
+    t1 = time()
     threads = []
     for thread_index, ip_group in enumerate(ip_division):
         threads.append(Thread(name=f"rtsp_brute_force_thread_{thread_index}", target=loginHandler, args=(ip_group, arguments.user, arguments.password, arguments.verbose,)))
         threads[-1].start()
     display(':', f"Started All {Back.MAGENTA}{arguments.threads}{Back.RESET}")
+    for thread in threads:
+        thread.join()
+    t2 = time()
+    display('+', f"All Threads Completed Execution")
+    display(':', f"\tTotal IP Addresses       = {Back.MAGENTA}{total_ips}{Back.RESET}")
+    display(':', f"\tSuccessful Authorization = {Back.MAGENTA}{len(successful_logins)}{Back.RESET}")
+    display(':', f"\tTime Taken               = {Back.MAGENTA}{t2-t1:.2f} seconds{Back.RESET}")
+    display(':', f"\tRate                     = {Back.MAGENTA}{len(total_ips)/(t2-t1):.2f} IPs/second{Back.RESET}")
