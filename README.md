@@ -25,6 +25,5 @@ It takes in the following command line arguments:
 * '-i', "--ip" : File Name of List of IP Addresses (Seperated by ',')
 * '-u', "--user" : Username for Brute Force
 * '-p', "--password" : Password For Brute Force
-* '-t', "--threads" : Number of Threads for Brute Force (Default=100)
-* '-v', "--verbose" : Dislay Additional Information (True/False, Default=False)
+* '-v', "--verbose" : Dislay Additional Information (True/False, Default=True)
 * '-w', "--write" : Name of the File for the Successfully Logged In IPs to be dumped (default=current data and time)
