@@ -3,7 +3,7 @@
 import cv2
 from datetime import date
 from urllib.parse import quote
-from multiprocessing import Process, Lock, Pool, cpu_count
+from multiprocessing import Lock, Pool, cpu_count
 from optparse import OptionParser
 from colorama import Fore, Back, Style
 from time import strftime, localtime, sleep, time
