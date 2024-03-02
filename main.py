@@ -98,9 +98,9 @@ if __name__ == "__main__":
         arguments.password = ['']
     else:
         try:
-            with open(arguments.password, 'r') as file:
+            with open(arguments.password, 'rb') as file:
                 display(':', f"Loading Passwords from File {Back.MAGENTA}{arguments.password}{Back.RESET}")
-                arguments.password = [quote(password) for password in file.read().split('\n')]
+                arguments.password = [quote(password) for password in file.read().decode(errors="ignore").split('\n')]
                 display('+', f"Passwords Loaded = {Back.MAGENTA}{len(arguments.password)}{Back.RESET}")
         except FileNotFoundError:
             arguments.password = [quote(password) for password in arguments.password.split(',')]
