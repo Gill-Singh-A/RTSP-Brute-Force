@@ -31,6 +31,8 @@ threads_number = cpu_count()
 verbose = True
 
 def loginRTSP(ip, user, password):
+    user = quote(user)
+    password = quote(password)
     try:
         if user == '':
             video_capture = cv2.VideoCapture(f"rtsp://{ip}")
@@ -85,10 +87,10 @@ if __name__ == "__main__":
         try:
             with open(arguments.user, 'r') as file:
                 display(':', f"Loading Users from File {Back.MAGENTA}{arguments.users}{Back.RESET}")
-                arguments.users = [quote(user) for user in file.read().split('\n')]
+                arguments.users = [user for user in file.read().split('\n')]
                 display('+', f"Users Loaded = {Back.MAGENTA}{len(arguments.users)}{Back.RESET}")
         except FileNotFoundError:
-            arguments.user = [quote(user) for user in arguments.user.split(',')]
+            arguments.user = [user for user in arguments.user.split(',')]
         except:
             display('-', f"Error Loading Users from File {Back.YELLOW}{arguments.user}{Back.RESET}")
             exit(0)
@@ -100,10 +102,10 @@ if __name__ == "__main__":
         try:
             with open(arguments.password, 'rb') as file:
                 display(':', f"Loading Passwords from File {Back.MAGENTA}{arguments.password}{Back.RESET}")
-                arguments.password = [quote(password) for password in file.read().decode(errors="ignore").split('\n')]
+                arguments.password = [password for password in file.read().decode(errors="ignore").split('\n')]
                 display('+', f"Passwords Loaded = {Back.MAGENTA}{len(arguments.password)}{Back.RESET}")
         except FileNotFoundError:
-            arguments.password = [quote(password) for password in arguments.password.split(',')]
+            arguments.password = [password for password in arguments.password.split(',')]
         except:
             display('-', f"Error Loading Passwords from File {Back.YELLOW}{arguments.password}{Back.RESET}")
             exit(0)
