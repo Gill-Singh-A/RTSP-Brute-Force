@@ -91,6 +91,8 @@ if __name__ == "__main__":
                 display('+', f"Users Loaded = {Back.MAGENTA}{len(arguments.users)}{Back.RESET}")
         except FileNotFoundError:
             arguments.user = [user for user in arguments.user.split(',')]
+        except OSError:
+            arguments.user = [user for user in arguments.user.split(',')]
         except:
             display('-', f"Error Loading Users from File {Back.YELLOW}{arguments.user}{Back.RESET}")
             exit(0)
@@ -105,6 +107,8 @@ if __name__ == "__main__":
                 arguments.password = [password for password in file.read().decode(errors="ignore").split('\n')]
                 display('+', f"Passwords Loaded = {Back.MAGENTA}{len(arguments.password)}{Back.RESET}")
         except FileNotFoundError:
+            arguments.password = [password for password in arguments.password.split(',')]
+        except OSError:
             arguments.password = [password for password in arguments.password.split(',')]
         except:
             display('-', f"Error Loading Passwords from File {Back.YELLOW}{arguments.password}{Back.RESET}")
