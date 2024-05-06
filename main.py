@@ -6,7 +6,7 @@ from urllib.parse import quote
 from multiprocessing import Lock, Pool, cpu_count
 from optparse import OptionParser
 from colorama import Fore, Back, Style
-from time import strftime, localtime, sleep, time
+from time import strftime, localtime, time
 
 status_color = {
     '+': Fore.GREEN,
