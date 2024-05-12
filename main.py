@@ -72,8 +72,9 @@ if __name__ == "__main__":
             try:
                 with open(ip_detail, 'r') as file:
                     display(':', f"Loading IPs from File {Back.MAGENTA}{ip_detail}{Back.RESET}")
-                    ips.extend(file.read().split('\n'))
-                    display('+', f"IPs Loaded = {Back.MAGENTA}{len(arguments.ip)}{Back.RESET}")
+                    current_ips = file.read().split('\n')
+                    ips.extend(current_ips)
+                    display('+', f"IPs Loaded = {Back.MAGENTA}{len(current_ips)}{Back.RESET}")
             except FileNotFoundError:
                 ips.append(ip_detail)
             except:
@@ -128,10 +129,10 @@ if __name__ == "__main__":
     total_ips = len(ips)
     total_details = len(details)
     display(':', f"Total Number of IP Addresses = {Back.MAGENTA}{total_ips}{Back.RESET}")
-    display(':', f"Creating {Back.MAGENTA}{arguments.threads}{Back.RESET} Threads Details", start='\n')
+    display(':', f"Creating {Back.MAGENTA}{arguments.threads}{Back.RESET} Threads", start='\n')
     detail_division = [details[group*total_details//arguments.threads:(group+1)*total_details//arguments.threads] for group in range(arguments.threads)]
     display('+', f"Created {Back.MAGENTA}{arguments.threads}{Back.RESET} Threads")
-    display(':', f"Starting {Back.MAGENTA}{arguments.threads}{Back.RESET} Threads Details", start='\n')
+    display(':', f"Starting {Back.MAGENTA}{arguments.threads}{Back.RESET} Threads", start='\n')
     t1 = time()
     threads = []
     for thread_index, detail_group in enumerate(detail_division):
