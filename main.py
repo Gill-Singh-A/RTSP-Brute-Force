@@ -122,10 +122,10 @@ if __name__ == "__main__":
             exit(0)
     arguments.threads = threads_number
     pool = Pool(arguments.threads)
-    if arguments.verbose == "True":
-        arguments.verbose = True
-    else:
+    if arguments.verbose == "False":
         arguments.verbose = False
+    else:
+        arguments.verbose = True
     if arguments.capture == "True":
         cwd = Path.cwd()
         frames_folder = cwd / "frames"
