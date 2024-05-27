@@ -41,9 +41,10 @@ def loginRTSP(ip, user, password):
         else:
             video_capture = cv2.VideoCapture(f"rtsp://{user}:{password}@{ip}")
         if video_capture.isOpened():
-            ret, frame = video_capture.read()
-            if ret:
-                cv2.imwrite(f"frames/{ip}.jpg", frame)
+            if capture_frame:
+                ret, frame = video_capture.read()
+                if ret:
+                    cv2.imwrite(f"frames/{ip}.jpg", frame)
             return True
         else:
             return False
