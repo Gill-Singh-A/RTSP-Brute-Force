@@ -94,9 +94,9 @@ if __name__ == "__main__":
     else:
         try:
             with open(arguments.user, 'r') as file:
-                display(':', f"Loading Users from File {Back.MAGENTA}{arguments.users}{Back.RESET}")
-                arguments.users = [user for user in file.read().split('\n')]
-                display('+', f"Users Loaded = {Back.MAGENTA}{len(arguments.users)}{Back.RESET}")
+                display(':', f"Loading Users from File {Back.MAGENTA}{arguments.user}{Back.RESET}")
+                arguments.user = [user for user in file.read().split('\n')]
+                display('+', f"Users Loaded = {Back.MAGENTA}{len(arguments.user)}{Back.RESET}")
         except FileNotFoundError:
             arguments.user = [user for user in arguments.user.split(',')]
         except OSError:
