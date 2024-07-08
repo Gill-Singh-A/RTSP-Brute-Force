@@ -26,3 +26,5 @@ It takes in the following command line arguments:
 * '-p', "--password" : Password For Brute Force (Seperated by ',', either File Name or Password itself)
 * '-v', "--verbose" : Dislay Additional Information (True/False, Default=True)
 * '-w', "--write" : Name of the CSV File for the Successfully Logged In IPs to be dumped (default=current data and time)
+<!-- --><br />
+To see how we can Brute-Force RTSP Protocol and gain access to CCTVs using this Program, see the Blog [Compromising CCTVs 101](https://medium.com/@amansg22/compromising-cctvs-101-ecd41748c90c) on [Medium](https://medium.com/@amansg22).
