@@ -2,6 +2,7 @@
 
 import cv2
 from scapy.all import *
+from hashlib import md5
 from pathlib import Path
 from datetime import date
 from base64 import b64decode
@@ -34,6 +35,10 @@ threads_number = cpu_count()
 verbose = True
 capture_frame = False
 
+def calculateDigestResponse(username, password, realm, method, uri, nonce):
+    hash_1 = md5(f"{username}:{realm}:{password}".encode()).hexdigest()
+    hash_2 = md5(f"{method}:{uri}".encode()).hexdigest()
+    return md5(f"{hash_1}:{nonce}:{hash_2}".encode()).hexdigest()
 def loginRTSP(ip, user, password):
     user = quote(user)
     password = quote(password)
