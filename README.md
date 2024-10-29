@@ -1,6 +1,5 @@
 # RTSP Brute Force
 A Python Program that uses OpenCV module to brute force RTSP (Real Time Streaming Protocol) Service used by IoT (Internet of Things) devices like CCTVs (Closed-circuit television), etc.
-
 ## Requirements
 Language Used = Python3<br />
 Modules/Packages used:
