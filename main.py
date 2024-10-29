@@ -1,6 +1,7 @@
 #! /usr/bin/env python3
 
 import cv2
+from pickle import dump
 from scapy.all import *
 from hashlib import md5
 from pathlib import Path
@@ -73,6 +74,7 @@ def loginHandler(details, verbose=False):
 if __name__ == "__main__":
     arguments = get_arguments(('-i', "--ip", "ip", "File Name of List of IP Addresses (Seperated by ',', either File Name or IP itself)"),
                               ('-C', "--capture-file", "capture_file", "Packet Capture Files (Seperated by ',')"),
+                              ('-D', "--capture-file-data", "capture_file_data", f"Dump Data Extracted from Capture File in Pickle Format (Optional)"),
                               ('-u', "--user", "user", "Username for Brute Force (Seperated by ',', either File Name or User itself)"),
                               ('-p', "--password", "password", "Password For Brute Force (Seperated by ',', either File Name or Password itself)"),
                               ('-v', "--verbose", "verbose", f"Dislay Additional Information (True/False, Default={verbose})"),
@@ -104,6 +106,8 @@ if __name__ == "__main__":
                                         rtsp_authentications[device_id]["authorization"] = "DIGEST"
                                         rtsp_authentications[device_id]["device"] = network_packet[IP].dst
                                         rtsp_authentications[device_id]["source"] = network_packet[IP].src
+                                        rtsp_authentications[device_id]["device_port"] = network_packet[TCP].dport
+                                        rtsp_authentications[device_id]["source_port"] = network_packet[TCP].sport
                                         break
                                     elif "Authorization" in line:
                                         authorization = "BASIC"
@@ -115,16 +119,22 @@ if __name__ == "__main__":
                                             "method": method,
                                             "authorization": authorization,
                                             "device": network_packet[IP].dst,
-                                            "source": network_packet[IP].src
+                                            "source": network_packet[IP].src,
+                                            "device_port": network_packet[TCP].dport,
+                                            "source_port": network_packet[TCP].sport
                                         }
                                         break
                     except:
                         pass
             except Exception as error:
                 display('-', f"Error Occured while reading Packet Capture File {Back.MAGENTA}{packet_capture_file}{Back.RESET} => {Back.YELLOW}{error}{Back.RESET}")
-            for rtsp_device in rtsp_devices.values():
+            del rtsp_authentications
+            rtsp_devices = list(rtsp_devices.values())
+            for rtsp_device in rtsp_devices:
                 display('*', f"RTSP Device => {Back.MAGENTA}{rtsp_device['device']}{Back.RESET}")
                 display('*', f"RTSP Client => {Back.MAGENTA}{rtsp_device['source']}{Back.RESET}")
+                display('*', f"RTSP Device Port => {Back.MAGENTA}{rtsp_device['device_port']}{Back.RESET}")
+                display('*', f"RTSP Client Port => {Back.MAGENTA}{rtsp_device['source_port']}{Back.RESET}")
                 display('+', f"Method => {Back.MAGENTA}{rtsp_device['method']}{Back.RESET}")
                 display('+', f"Authorization => {Back.MAGENTA}{rtsp_device['authorization']}{Back.RESET}")
                 if rtsp_device['authorization'] == "DIGEST":
@@ -136,7 +146,9 @@ if __name__ == "__main__":
                 else:
                     display(':', f"\t* Username = {Back.MAGENTA}{rtsp_device['username']}{Back.RESET}")
                     display(':', f"\t* Password = {Back.MAGENTA}{rtsp_device['password']}{Back.RESET}")
-                print(Fore.CYAN + '-'*100 + Fore.RESET)
+                if arguments.capture_file_data:
+                    with open(arguments.capture_file_data, 'wb') as file:
+                        dump(rtsp_devices, file)
             exit(0)
     else:
         ips = []
