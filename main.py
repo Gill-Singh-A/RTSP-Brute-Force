@@ -114,11 +114,11 @@ if __name__ == "__main__":
         display('-', "Please Provide a List of IP Addresses")
         exit(0)
     elif arguments.capture_file:
+        rtsp_devices = {}
+        rtsp_authentications = {}
         for packet_capture_file in arguments.capture_file.split(','):
             try:
                 packets = rdpcap(packet_capture_file)
-                rtsp_devices = {}
-                rtsp_authentications = {}
                 for network_packet in packets:
                     try:
                         if Raw in network_packet and "RTSP" in network_packet[Raw].load.decode():
@@ -158,42 +158,42 @@ if __name__ == "__main__":
                         pass
             except Exception as error:
                 display('-', f"Error Occured while reading Packet Capture File {Back.MAGENTA}{packet_capture_file}{Back.RESET} => {Back.YELLOW}{error}{Back.RESET}")
-            del rtsp_authentications
-            rtsp_devices = list(rtsp_devices.values())
-            successful_logins = []
-            for rtsp_device in rtsp_devices:
-                print(Fore.CYAN + '-'*100 + Fore.RESET)
-                display('*', f"RTSP Device => {Back.MAGENTA}{rtsp_device['device']}{Back.RESET}")
-                display('*', f"RTSP Client => {Back.MAGENTA}{rtsp_device['source']}{Back.RESET}")
-                display('*', f"RTSP Device Port => {Back.MAGENTA}{rtsp_device['device_port']}{Back.RESET}")
-                display('*', f"RTSP Client Port => {Back.MAGENTA}{rtsp_device['source_port']}{Back.RESET}")
-                display('+', f"Method => {Back.MAGENTA}{rtsp_device['method']}{Back.RESET}")
-                display('+', f"Authorization => {Back.MAGENTA}{rtsp_device['authorization']}{Back.RESET}")
-                if rtsp_device['authorization'] == "DIGEST":
-                    display(':', f"\t* Username = {Back.MAGENTA}{rtsp_device['username']}{Back.RESET}")
-                    display(':', f"\t* Realm = {Back.MAGENTA}{rtsp_device['realm']}{Back.RESET}")
-                    display(':', f"\t* Nonce = {Back.MAGENTA}{rtsp_device['nonce']}{Back.RESET}")
-                    display(':', f"\t* URI = {Back.MAGENTA}{rtsp_device['uri']}{Back.RESET}")
-                    display(':', f"\t* Response = {Back.MAGENTA}{rtsp_device['response']}{Back.RESET}")
-                else:
-                    display(':', f"\t* Username = {Back.MAGENTA}{rtsp_device['username']}{Back.RESET}")
-                    display(':', f"\t* Password = {Back.MAGENTA}{rtsp_device['password']}{Back.RESET}")
-                    successful_logins.append({"ip": rtsp_device["device"], "user": rtsp_device["username"], "password": rtsp_device["password"]})
-                print(Fore.CYAN + '-'*100 + Fore.RESET)
-            if arguments.capture_file_data:
-                with open(arguments.capture_file_data, 'wb') as file:
-                    dump(rtsp_devices, file)
-            pool = Pool(threads_number)
-            threads = []
-            rtsp_devices = [[rtsp_device["device"], rtsp_device["username"], rtsp_device["realm"], rtsp_device["method"], rtsp_device["uri"], rtsp_device["nonce"], rtsp_device["response"].strip()] for rtsp_device in rtsp_devices if rtsp_device["authorization"] == "DIGEST"]
-            total_rtsp_devices = len(rtsp_devices)
-            rtsp_devices_divisions = [rtsp_devices[index*total_rtsp_devices//threads_number: (index+1)*total_rtsp_devices//threads_number] for index in range(threads_number)]
-            for index, rtsp_devices_division in enumerate(rtsp_devices_divisions):
-                threads.append(pool.apply_async(calculateDigestResponse_Handler, (rtsp_devices_division, )))
-            for thread in threads:
-                successful_logins.extend(thread.get())
-            pool.close()
-            pool.join()
+        del rtsp_authentications
+        rtsp_devices = list(rtsp_devices.values())
+        successful_logins = []
+        for rtsp_device in rtsp_devices:
+            print(Fore.CYAN + '-'*100 + Fore.RESET)
+            display('*', f"RTSP Device => {Back.MAGENTA}{rtsp_device['device']}{Back.RESET}")
+            display('*', f"RTSP Client => {Back.MAGENTA}{rtsp_device['source']}{Back.RESET}")
+            display('*', f"RTSP Device Port => {Back.MAGENTA}{rtsp_device['device_port']}{Back.RESET}")
+            display('*', f"RTSP Client Port => {Back.MAGENTA}{rtsp_device['source_port']}{Back.RESET}")
+            display('+', f"Method => {Back.MAGENTA}{rtsp_device['method']}{Back.RESET}")
+            display('+', f"Authorization => {Back.MAGENTA}{rtsp_device['authorization']}{Back.RESET}")
+            if rtsp_device['authorization'] == "DIGEST":
+                display(':', f"\t* Username = {Back.MAGENTA}{rtsp_device['username']}{Back.RESET}")
+                display(':', f"\t* Realm = {Back.MAGENTA}{rtsp_device['realm']}{Back.RESET}")
+                display(':', f"\t* Nonce = {Back.MAGENTA}{rtsp_device['nonce']}{Back.RESET}")
+                display(':', f"\t* URI = {Back.MAGENTA}{rtsp_device['uri']}{Back.RESET}")
+                display(':', f"\t* Response = {Back.MAGENTA}{rtsp_device['response']}{Back.RESET}")
+            else:
+                display(':', f"\t* Username = {Back.MAGENTA}{rtsp_device['username']}{Back.RESET}")
+                display(':', f"\t* Password = {Back.MAGENTA}{rtsp_device['password']}{Back.RESET}")
+                successful_logins.append({"ip": rtsp_device["device"], "user": rtsp_device["username"], "password": rtsp_device["password"]})
+            print(Fore.CYAN + '-'*100 + Fore.RESET)
+        if arguments.capture_file_data:
+            with open(arguments.capture_file_data, 'wb') as file:
+                dump(rtsp_devices, file)
+        pool = Pool(threads_number)
+        threads = []
+        rtsp_devices = [[rtsp_device["device"], rtsp_device["username"], rtsp_device["realm"], rtsp_device["method"], rtsp_device["uri"], rtsp_device["nonce"], rtsp_device["response"].strip()] for rtsp_device in rtsp_devices if rtsp_device["authorization"] == "DIGEST"]
+        total_rtsp_devices = len(rtsp_devices)
+        rtsp_devices_divisions = [rtsp_devices[index*total_rtsp_devices//threads_number: (index+1)*total_rtsp_devices//threads_number] for index in range(threads_number)]
+        for index, rtsp_devices_division in enumerate(rtsp_devices_divisions):
+            threads.append(pool.apply_async(calculateDigestResponse_Handler, (rtsp_devices_division, )))
+        for thread in threads:
+            successful_logins.extend(thread.get())
+        pool.close()
+        pool.join()
     else:
         ips = []
         for ip_detail in arguments.ip.split(','):
