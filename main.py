@@ -1076,7 +1076,14 @@ if __name__ == "__main__":
             except:
                 display('-', f"Error Loading IPs from File {arguments.ip}")
                 exit(0)
-        ips = [ip for ip in ips if ip.strip()]
+        # De-duplicate targets (order-preserving, whitespace-trimmed) so a host
+        # listed more than once in the input isn't fingerprinted, cracked and
+        # logged repeatedly — each unique target is processed exactly once.
+        trimmed = [ip.strip() for ip in ips if ip.strip()]
+        ips = list(dict.fromkeys(trimmed))
+        duplicates_removed = len(trimmed) - len(ips)
+        if duplicates_removed:
+            display(':', f"Skipping {duplicates_removed} duplicate target(s)")
         if not arguments.user:
             display('*', f"No USER Specified")
             display(':', f"Trying to Find Unauthorized Access")
