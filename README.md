@@ -41,10 +41,23 @@ It takes in the following command line arguments:
 * `-a`, `--all-defaults` : After the wordlist, also try every scraped vendor default as a fallback (True/False, Default=False)
 * `-t`, `--threads` : Number of worker threads (Default: `min(64, cpu_count * 5)`)
 * `-r`, `--reach-timeout` : TCP reachability pre-check timeout in seconds; `0` disables it (Default=2.0)
+* `-R`, `--rtsp-timeout` : Per-request RTSP `DESCRIBE` timeout in seconds (Default=6.0)
+* `-H`, `--http-port` : HTTP/ONVIF port for fingerprinting on cameras whose web interface isn't on `80` (Default=80). Tried first, ahead of the standard ONVIF ports. The **RTSP** port is set per target with `host:port` (see below).
 * `-v`, `--verbose` : Display additional information (True/False, Default=True)
 * `-c`, `--capture` : Capture a frame if login is successful (True/False, Default=False)
 * `-w`, `--write` : Name of the CSV file for the successfully logged-in IPs to be dumped (default = current date and time). Columns: `User,Password,IP,Vendor,Model`
 <!-- --><br />
+
+### Target syntax (non-default ports)
+Each target may be a bare host or `host:port`, where `port` is the **RTSP** port (default `554`). This applies both to `-i` values and to each line of an IP-list file. IPv6 must be bracketed.
+
+```
+172.29.114.250          # RTSP on the default 554
+172.29.114.250:8554     # RTSP on a non-default port
+[fe80::1]:10554         # bracketed IPv6 + port
+```
+
+The RTSP port set this way flows through reachability, the native `DESCRIBE` engine, and the FFmpeg fallback. Fingerprinting/ONVIF still targets HTTP port `80` (plus the standard ONVIF ports); use `-H`/`--http-port` when the camera's web/ONVIF interface is on a different port.
 
 ### Examples
 ```bash
@@ -53,6 +66,9 @@ python3 main.py -i targets.txt -u admin,root -p passwords.txt
 
 # Also try every scraped vendor default as a fallback, capture a frame on success
 python3 main.py -i 192.168.1.10,192.168.1.11 -u admin -p admin,12345 -a True -c True
+
+# RTSP on a non-default port, with the web/ONVIF interface on 8899
+python3 main.py -i 192.168.1.10:8554 -H 8899 -u admin -p admin@123
 
 # Crack digest/basic auth captured in a packet capture
 python3 main.py -C capture.pcap -p passwords.txt

@@ -854,6 +854,8 @@ def crack_host(target, base_combos, db, options):
     """Fingerprint one host, build its vendor/model routes, then brute force the
     credential x route space (first success wins). Returns a result dict."""
     host, http_port, rtsp_port = parse_target(target)
+    if options.get("http_port"):        # -H overrides the HTTP/ONVIF port
+        http_port = options["http_port"]
 
     if options["reach_timeout"] > 0 and not tcp_reachable(
             host, [rtsp_port, http_port], options["reach_timeout"]):
@@ -949,6 +951,7 @@ if __name__ == "__main__":
                               ('-t', "--threads", "threads", f"Number of worker threads (Default={threads_number})"),
                               ('-r', "--reach-timeout", "reach_timeout", "TCP reachability pre-check timeout in seconds; 0 disables it (Default=2.0)"),
                               ('-R', "--rtsp-timeout", "rtsp_timeout", "Per-request RTSP DESCRIBE timeout in seconds (Default=6.0)"),
+                              ('-H', "--http-port", "http_port", "HTTP/ONVIF port for fingerprinting on cameras whose web interface isn't on 80 (Default=80). Tried first, ahead of the standard ONVIF ports. The RTSP port is set per target with host:port."),
                               ('-v', "--verbose", "verbose", f"Dislay Additional Information (True/False, Default={verbose})"),
                               ('-c', "--capture", "capture", f"Capture Frame if Successful Login (True/False, Default={capture_frame})"),
                               ('-w', "--write", "write", "Name of the CSV File for the Successfully Logged In IPs to be dumped (default=current data and time)"))
@@ -1100,6 +1103,7 @@ if __name__ == "__main__":
         reach_timeout = float(arguments.reach_timeout) if arguments.reach_timeout is not None else 2.0
         rtsp_timeout = float(arguments.rtsp_timeout) if arguments.rtsp_timeout is not None else 6.0
         max_routes = int(arguments.max_routes) if arguments.max_routes is not None else 25
+        http_port_override = int(arguments.http_port) if arguments.http_port else None
         if arguments.capture == "True":
             frames_folder = Path.cwd() / "frames"
             frames_folder.mkdir(exist_ok=True)
@@ -1135,6 +1139,7 @@ if __name__ == "__main__":
             "reach_timeout": reach_timeout,
             "rtsp_timeout": rtsp_timeout,
             "max_routes": max_routes,
+            "http_port": http_port_override,
             "fp_user": arguments.user[0] if arguments.user else "",
             "fp_pass": arguments.password[0] if arguments.password else "",
         }
