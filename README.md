@@ -10,7 +10,8 @@ For each target host the tool runs a best-effort chain and stops at the first wo
 
 1. **Reachability pre-check** — a fast TCP connect to the RTSP/HTTP port; offline hosts are marked *Unreachable* and skipped instantly (no slow RTSP probing). Timeout via `-r` (`0` disables the check).
 2. **Fingerprint** — vendor/model via ONVIF `GetDeviceInformation` (if the optional `onvif-zeep` package is installed), else the HTTP `Server` header / 401 `WWW-Authenticate` realm / page `<title>`, else the RTSP `OPTIONS` `Server` header.
-3. **Credential order** — the fingerprinted vendor's default credential first, then the user-supplied `user × password` combinations, then (optionally, with `-a`) every scraped vendor default as a last-resort fallback.
+3. **Exact stream path (ONVIF)** — when the camera speaks ONVIF, `GetStreamUri` is queried for the device's *actual* RTSP path(s); these go to the **front** of the route list, so path discovery is a fact rather than a guess. The credential ONVIF accepts is also tried first at the RTSP layer. Behind the ONVIF paths come the vendor/model paths from `data/cameras.csv` and a set of generic fall-backs. Falls back silently to the DB/generic routes when ONVIF is absent.
+4. **Credential order** — the fingerprinted vendor's default credential first, then the user-supplied `user × password` combinations, then (optionally, with `-a`) every scraped vendor default as a last-resort fallback.
 
 The default-credentials list is loaded automatically from the bundled `data/default_credentials.csv`. Override the path with `-d`.
 
@@ -20,7 +21,7 @@ Concurrency uses a **thread pool** (`concurrent.futures.ThreadPoolExecutor`) —
 
 ## Requirements
 Language: Python 3<br />
-Modules/Packages used: `colorama`, `tqdm` (progress bar), `cv2` (opencv-python), `scapy` (third-party); `pickle`, `hashlib`, `base64`, `socket`, `re`, `csv`, `threading`, `concurrent.futures`, `pathlib`, `datetime`, `urllib`, `optparse`, `time` (standard library). `onvif-zeep` is optional (enables ONVIF vendor+model fingerprinting). Every third-party import is guarded, so the tool still runs (with reduced features) if an optional one is missing.
+Modules/Packages used: `colorama`, `tqdm` (progress bar), `cv2` (opencv-python), `scapy` (third-party); `pickle`, `hashlib`, `base64`, `socket`, `re`, `csv`, `threading`, `concurrent.futures`, `pathlib`, `datetime`, `urllib`, `optparse`, `time` (standard library). `onvif-zeep` is optional (enables ONVIF vendor+model fingerprinting and exact stream-path discovery via `GetStreamUri`). Every third-party import is guarded, so the tool still runs (with reduced features) if an optional one is missing.
 
 Install the dependencies:
 ```bash

