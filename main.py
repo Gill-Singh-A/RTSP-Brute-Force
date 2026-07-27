@@ -57,6 +57,19 @@ try:
 except Exception:
     _HAS_CV2 = False
 
+# tqdm draws the per-phase progress bar. Optional: without it the tool runs
+# exactly as before, just without the bar.
+try:
+    from tqdm import tqdm  # type: ignore
+    _HAS_TQDM = True
+except Exception:
+    _HAS_TQDM = False
+
+# When a tqdm bar is active, per-host log lines must go through ``tqdm.write`` so
+# they print above the bar instead of tearing it. ``crack_host`` runs on worker
+# threads, so writes to this are already serialised by ``lock`` in display().
+_active_bar = None
+
 status_color = {
     '+': Fore.GREEN,
     '-': Fore.RED,
@@ -66,7 +79,11 @@ status_color = {
 }
 
 def display(status, data, start='', end='\n'):
-    print(f"{start}{status_color[status]}[{status}] {Fore.BLUE}[{date.today()} {strftime('%H:%M:%S', localtime())}] {status_color[status]}{Style.BRIGHT}{data}{Fore.RESET}{Style.RESET_ALL}", end=end)
+    message = f"{start}{status_color[status]}[{status}] {Fore.BLUE}[{date.today()} {strftime('%H:%M:%S', localtime())}] {status_color[status]}{Style.BRIGHT}{data}{Fore.RESET}{Style.RESET_ALL}"
+    if _active_bar is not None:
+        _active_bar.write(message, end=end)
+    else:
+        print(message, end=end)
 
 def get_arguments(*args):
     parser = OptionParser()
@@ -821,10 +838,17 @@ if __name__ == "__main__":
         digest_devices = [[rtsp_device["device"], rtsp_device["username"], rtsp_device["realm"], rtsp_device["method"], rtsp_device["uri"], rtsp_device["nonce"], rtsp_device["response"].strip()] for rtsp_device in rtsp_devices if rtsp_device["authorization"] == "DIGEST"]
         if digest_devices:
             display(':', f"Cracking {Back.MAGENTA}{len(digest_devices)}{Back.RESET} Digest Authentication(s)", start='\n')
+            if _HAS_TQDM:
+                _active_bar = tqdm(total=len(digest_devices), desc="Cracking digests", unit="dev")
             with ThreadPoolExecutor(max_workers=threads_number) as executor:
                 for result in executor.map(lambda device: crack_digest_device(device, arguments.password), digest_devices):
                     if result:
                         successful_logins.append(result)
+                    if _active_bar is not None:
+                        _active_bar.update(1)
+            if _active_bar is not None:
+                _active_bar.close()
+                _active_bar = None
     else:
         ips = []
         for ip_detail in arguments.ip.split(','):
@@ -914,6 +938,8 @@ if __name__ == "__main__":
         t1 = time()
         successful_logins = []
         unreachable = 0
+        if _HAS_TQDM:
+            _active_bar = tqdm(total=total_ips, desc="Brute forcing", unit="host")
         with ThreadPoolExecutor(max_workers=threads_number) as executor:
             futures = {executor.submit(crack_host, ip, base_combos, db, options): ip for ip in ips}
             for future in as_completed(futures):
@@ -922,6 +948,11 @@ if __name__ == "__main__":
                     successful_logins.append(result)
                 elif result["status"] == "UNREACHABLE":
                     unreachable += 1
+                if _active_bar is not None:
+                    _active_bar.update(1)
+        if _active_bar is not None:
+            _active_bar.close()
+            _active_bar = None
         t2 = time()
 
         display('+', f"All {Back.MAGENTA}{threads_number}{Back.RESET} Threads Completed Execution", start='\n')

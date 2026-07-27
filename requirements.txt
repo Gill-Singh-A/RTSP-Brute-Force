@@ -1,5 +1,6 @@
 # Required
 colorama            # coloured terminal output
+tqdm                # per-phase progress bar (import-guarded; runs without it)
 
 # Optional — the tool degrades gracefully without these
 opencv-python       # frame capture on success (-c); core brute force runs without it

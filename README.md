@@ -20,7 +20,7 @@ Concurrency uses a **thread pool** (`concurrent.futures.ThreadPoolExecutor`) —
 
 ## Requirements
 Language: Python 3<br />
-Modules/Packages used: `cv2` (opencv-python), `scapy`, `colorama` (third-party); `pickle`, `hashlib`, `base64`, `socket`, `re`, `csv`, `threading`, `concurrent.futures`, `pathlib`, `datetime`, `urllib`, `optparse`, `time` (standard library). `onvif-zeep` is optional (enables ONVIF vendor+model fingerprinting).
+Modules/Packages used: `colorama`, `tqdm` (progress bar), `cv2` (opencv-python), `scapy` (third-party); `pickle`, `hashlib`, `base64`, `socket`, `re`, `csv`, `threading`, `concurrent.futures`, `pathlib`, `datetime`, `urllib`, `optparse`, `time` (standard library). `onvif-zeep` is optional (enables ONVIF vendor+model fingerprinting). Every third-party import is guarded, so the tool still runs (with reduced features) if an optional one is missing.
 
 Install the dependencies:
 ```bash
