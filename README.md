@@ -43,21 +43,23 @@ It takes in the following command line arguments:
 * `-r`, `--reach-timeout` : TCP reachability pre-check timeout in seconds; `0` disables it (Default=2.0)
 * `-R`, `--rtsp-timeout` : Per-request RTSP `DESCRIBE` timeout in seconds (Default=6.0)
 * `-H`, `--http-port` : HTTP/ONVIF port for fingerprinting on cameras whose web interface isn't on `80` (Default=80). Tried first, ahead of the standard ONVIF ports. The **RTSP** port is set per target with `host:port` (see below).
+* `-T`, `--tls` : Force **RTSP-over-TLS / RTSPS** on (`True`) or off (`False`) for every target. **Unset (default) = auto-detect per host.** Per-target TLS can also be set with an `rtsps://`/`rtsp://` prefix, e.g. `rtsps://host:9000`.
 * `-v`, `--verbose` : Display additional information (True/False, Default=True)
 * `-c`, `--capture` : Capture a frame if login is successful (True/False, Default=False)
 * `-w`, `--write` : Name of the CSV file for the successfully logged-in IPs to be dumped (default = current date and time). Columns: `User,Password,IP,Vendor,Model`
 <!-- --><br />
 
-### Target syntax (non-default ports)
-Each target may be a bare host or `host:port`, where `port` is the **RTSP** port (default `554`). This applies both to `-i` values and to each line of an IP-list file. IPv6 must be bracketed.
+### Target syntax (non-default ports, TLS)
+Each target may be a bare host or `host:port`, where `port` is the **RTSP** port (default `554`), optionally prefixed with an `rtsp://` or `rtsps://` scheme. This applies both to `-i` values and to each line of an IP-list file. IPv6 must be bracketed.
 
 ```
 172.29.114.250          # RTSP on the default 554
 172.29.114.250:8554     # RTSP on a non-default port
 [fe80::1]:10554         # bracketed IPv6 + port
+rtsps://10.0.0.5:9000   # RTSP-over-TLS (RTSPS) on a non-default port
 ```
 
-The RTSP port set this way flows through reachability, the native `DESCRIBE` engine, and the FFmpeg fallback. Fingerprinting/ONVIF still targets HTTP port `80` (plus the standard ONVIF ports); use `-H`/`--http-port` when the camera's web/ONVIF interface is on a different port.
+The RTSP port set this way flows through reachability, the native `DESCRIBE` engine, and the FFmpeg fallback. **TLS/RTSPS is auto-detected by default** — each host gets a quick plaintext-first probe (a real RTSP server answers a plaintext `OPTIONS` instantly; only if it doesn't is a TLS handshake tried), so you don't need any flag for RTSPS cameras. Force it either way with `-T True`/`-T False`, or per target with an `rtsps://`/`rtsp://` prefix. When TLS is in effect, the `DESCRIBE` engine, the RTSP-`OPTIONS` fingerprint, and the FFmpeg fallback (`rtsps://`) all negotiate TLS, and reported URLs use the `rtsps://` scheme. Certificates aren't verified (cameras use self-signed certs). With no explicit port, `rtsps://` defaults to `322` (the IANA RTSPS port) instead of `554`. Note this only helps devices that speak **RTSP with Digest/Basic auth over TLS**; a TLS media gateway with web/token auth (no RTSP `401` challenge) still isn't brute-forceable. Fingerprinting/ONVIF still targets HTTP port `80` (plus the standard ONVIF ports); use `-H`/`--http-port` when the camera's web/ONVIF interface is on a different port.
 
 ### Examples
 ```bash

