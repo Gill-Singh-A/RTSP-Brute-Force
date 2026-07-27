@@ -56,4 +56,18 @@ python3 main.py -i 192.168.1.10,192.168.1.11 -u admin -p admin,12345 -a True -c 
 python3 main.py -C capture.pcap -p passwords.txt
 ```
 
+### Progress
+While running, a live [`tqdm`](https://github.com/tqdm/tqdm) bar tracks the current phase (one tick per host for the brute force, per device for the digest crack). Per-host result lines print **above** the bar so nothing is lost:
+
+```text
+[:] [2025-01-01 12:00:00] Total Number of IP Addresses = 3
+[:] [2025-01-01 12:00:00] Starting 40 Threads
+[-] [2025-01-01 12:00:01] 192.168.1.12 => Unreachable (skipped)
+[*] [2025-01-01 12:00:02] 192.168.1.10 => Vendor=Hikvision Model=?
+[+] [2025-01-01 12:00:02] admin:12345@192.168.1.10 => Access Granted (vendor=Hikvision)
+Brute forcing:  67%|██████▋   | 2/3 [00:01<00:00,  1.98host/s]
+```
+
+If `tqdm` isn't installed the tool runs identically, just without the bar.
+
 To see how we can brute-force the RTSP protocol and gain access to CCTVs using this program, see the blog [Compromising CCTVs 101](https://medium.com/@amansg22/compromising-cctvs-101-ecd41748c90c) on [Medium](https://medium.com/@amansg22).
