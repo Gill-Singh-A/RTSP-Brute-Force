@@ -6,3 +6,4 @@ tqdm                # per-phase progress bar (import-guarded; runs without it)
 opencv-python       # frame capture on success (-c); core brute force runs without it
 scapy               # packet-capture cracking mode (-C)
 onvif-zeep          # ONVIF fingerprinting (vendor + model); falls back to HTTP/RTSP headers
+pyyaml              # YAML vendor knowledge base (data/rtsp_vendors.yaml); falls back to CSV-only

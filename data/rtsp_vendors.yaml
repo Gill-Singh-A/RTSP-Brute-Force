@@ -1,0 +1,308 @@
+# RTSP Vendor Knowledge Base
+#
+# Banner signatures, vendor-specific RTSP paths and default credentials.
+# Loaded alongside the CSV camera DB; entries here augment (not replace) it.
+#
+# Schema:
+#   vendors:
+#     - name: <Canonical vendor name (matches VENDOR_SIGNATURES / CSV DB)>
+#       banners: [<substring matched case-insensitively against RTSP Server header>]
+#       paths: [<RTSP stream paths; use [CHANNEL] or {channel} for multi-channel>]
+#       creds:
+#         - [<username>, <password>]
+
+vendors:
+  - name: Hikvision
+    banners:
+      - "Hikvision-Webs"
+      - "DVRDVS-Webs"
+      - "DNVRS-Webs"
+      - "HiIpcam"
+      - "IPCamera"
+      - "NetDVMS"
+    paths:
+      - "/Streaming/Channels/[CHANNEL]01"
+      - "/Streaming/Channels/[CHANNEL]02"
+      - "/Streaming/channels/[CHANNEL]01"
+      - "/ISAPI/Streaming/Channels/[CHANNEL]01"
+      - "/h264/ch[CHANNEL]/main/av_stream"
+      - "/h264/ch[CHANNEL]/sub/av_stream"
+      - "/Streaming/Unicast/channels/[CHANNEL]01"
+    creds:
+      - ["admin", "12345"]
+      - ["admin", "admin"]
+      - ["admin", ""]
+
+  - name: Dahua
+    banners:
+      - "Dahua"
+      - "DH-"
+      - "Amcrest"
+      - "DHIP"
+    paths:
+      - "/cam/realmonitor?channel=[CHANNEL]&subtype=0"
+      - "/cam/realmonitor?channel=[CHANNEL]&subtype=1"
+      - "/cam/realmonitor?channel=[CHANNEL]&subtype=0&unicast=true&proto=Onvif"
+    creds:
+      - ["admin", "admin"]
+      - ["admin", ""]
+      - ["888888", "888888"]
+      - ["admin", "admin123"]
+
+  - name: Axis
+    banners:
+      - "Axis"
+      - "AXIS"
+    paths:
+      - "/axis-media/media.amp"
+      - "/axis-media/media.amp?camera=[CHANNEL]"
+      - "/mpeg4/media.amp"
+      - "/mjpg/video.mjpg"
+    creds:
+      - ["root", "pass"]
+      - ["root", "root"]
+      - ["admin", "admin"]
+
+  - name: Reolink
+    banners:
+      - "Reolink"
+    paths:
+      - "/h264Preview_[CHANNEL]_main"
+      - "/h264Preview_[CHANNEL]_sub"
+    creds:
+      - ["admin", ""]
+      - ["admin", "admin"]
+
+  - name: Foscam
+    banners:
+      - "Foscam"
+      - "IPCAM"
+    paths:
+      - "/videoMain"
+      - "/videoSub"
+      - "/11"
+      - "/12"
+    creds:
+      - ["admin", ""]
+      - ["admin", "admin"]
+
+  - name: Vivotek
+    banners:
+      - "Vivotek"
+      - "VIVOTEK"
+    paths:
+      - "/live.sdp"
+      - "/live2.sdp"
+      - "/video.mp4"
+    creds:
+      - ["root", ""]
+      - ["root", "root"]
+
+  - name: Bosch
+    banners:
+      - "Bosch"
+      - "DINION"
+    paths:
+      - "/rtsp_tunnel"
+      - "/video?inst=[CHANNEL]"
+    creds:
+      - ["", ""]
+      - ["service", "service"]
+
+  - name: Samsung
+    banners:
+      - "Samsung"
+      - "Hanwha"
+      - "SAMSUNG"
+    paths:
+      - "/profile[CHANNEL]/media.smp"
+      - "/onvif/profile[CHANNEL]/media.smp"
+    creds:
+      - ["admin", "4321"]
+      - ["admin", "admin"]
+
+  - name: Sony
+    banners:
+      - "Sony"
+      - "SONY"
+      - "SNC"
+    paths:
+      - "/media/video1"
+      - "/video1"
+      - "/oneshotimage1"
+      - "/image1"
+    creds:
+      - ["admin", "admin"]
+      - ["admin", ""]
+
+  - name: Panasonic
+    banners:
+      - "Panasonic"
+      - "WV-"
+    paths:
+      - "/MediaInput/h264/stream_[CHANNEL]"
+      - "/nphMotionJpeg?Resolution=640x480"
+      - "/cgi-bin/mjpeg"
+    creds:
+      - ["admin", "12345"]
+      - ["admin", "admin"]
+
+  - name: Ubiquiti
+    banners:
+      - "Ubiquiti"
+      - "UniFi"
+      - "ubnt"
+      - "AirVision"
+    paths:
+      - "/live/ch0[CHANNEL]_0"
+      - "/s0"
+      - "/ucast/11"
+    creds:
+      - ["ubnt", "ubnt"]
+      - ["admin", "admin"]
+
+  - name: D-Link
+    banners:
+      - "D-Link"
+      - "DCS-"
+    paths:
+      - "/live1.sdp"
+      - "/live2.sdp"
+      - "/video1.sdp"
+      - "/play1.sdp"
+      - "/live/ch[CHANNEL]"
+    creds:
+      - ["admin", ""]
+      - ["admin", "admin"]
+
+  - name: Tp-link
+    banners:
+      - "TP-LINK"
+      - "TP-Link"
+      - "TPLINK"
+      - "Tapo"
+    paths:
+      - "/stream1"
+      - "/stream2"
+      - "/h264_hd.sdp"
+    creds:
+      - ["admin", "admin"]
+
+  - name: Trendnet
+    banners:
+      - "Trendnet"
+      - "TRENDnet"
+    paths:
+      - "/v1/ch[CHANNEL]"
+      - "/live.sdp"
+    creds:
+      - ["admin", "admin"]
+
+  - name: Amcrest
+    banners:
+      - "Amcrest"
+    paths:
+      - "/cam/realmonitor?channel=[CHANNEL]&subtype=0"
+      - "/cam/realmonitor?channel=[CHANNEL]&subtype=1"
+    creds:
+      - ["admin", "admin"]
+      - ["admin", ""]
+
+  - name: Geovision
+    banners:
+      - "GeoVision"
+      - "Geovision"
+      - "GV-"
+    paths:
+      - "/CH00[CHANNEL].sdp"
+      - "/PictureCatch.cgi"
+    creds:
+      - ["admin", "admin"]
+
+  - name: Uniview
+    banners:
+      - "Uniview"
+      - "UNV"
+    paths:
+      - "/unicast/c[CHANNEL]/s0/live"
+      - "/unicast/c[CHANNEL]/s1/live"
+    creds:
+      - ["admin", "123456"]
+      - ["admin", "admin"]
+
+  - name: Lorex
+    banners:
+      - "Lorex"
+    paths:
+      - "/cam/realmonitor?channel=[CHANNEL]&subtype=0"
+      - "/cam/realmonitor?channel=[CHANNEL]&subtype=1"
+      - "/h264/ch[CHANNEL]/main/av_stream"
+    creds:
+      - ["admin", ""]
+      - ["admin", "admin"]
+
+  - name: Swann
+    banners:
+      - "Swann"
+    paths:
+      - "/cam/realmonitor?channel=[CHANNEL]&subtype=0"
+      - "/11"
+    creds:
+      - ["admin", "12345"]
+      - ["admin", "admin"]
+
+  - name: Wyze
+    banners:
+      - "Wyze"
+      - "WYZE"
+    paths:
+      - "/live"
+    creds:
+      - ["admin", "admin"]
+
+  - name: Acti
+    banners:
+      - "ACTi"
+    paths:
+      - "/cgi-bin/encoder?USER=[USERNAME]&PWD=[PASSWORD]"
+      - "/cgi-bin/video.jpg"
+    creds:
+      - ["admin", "123456"]
+      - ["Admin", "123456"]
+
+  - name: Mobotix
+    banners:
+      - "Mobotix"
+      - "MOBOTIX"
+    paths:
+      - "/mobotix-cgi/com/pda.cgi"
+    creds:
+      - ["admin", "meinsm"]
+
+  - name: Cp Plus
+    banners:
+      - "Rtsp Server/2.0"
+      - "CP PLUS"
+      - "CPPLUS"
+    paths:
+      - "/cam/realmonitor?channel=[CHANNEL]&subtype=0"
+      - "/cam/realmonitor?channel=[CHANNEL]&subtype=1"
+      - "/cam/realmonitor?channel=[CHANNEL]&subtype=0&unicast=true&proto=Onvif"
+    creds:
+      - ["admin", "admin"]
+      - ["admin", "admin123"]
+      - ["admin", ""]
+
+  - name: Hifocus
+    banners:
+      - "Customer RTSP Server"
+      - "HIFOCUS"
+    paths:
+      - "/profile1"
+      - "/profile2"
+      - "/cam/realmonitor?channel=[CHANNEL]&subtype=0"
+      - "/cam/realmonitor?channel=[CHANNEL]&subtype=1"
+    creds:
+      - ["admin", "admin123"]
+      - ["admin", "123456"]
+      - ["admin", "admin"]

